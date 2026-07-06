@@ -45,10 +45,11 @@ pub fn find_xochitl_pid() -> Result<i32> {
     pid.parse::<i32>().context("parsing xochitl pid")
 }
 
-/// Read a strip at a candidate address and return the fraction of pixels that look
-/// like real e-ink content: grayscale (B≈G≈R) and near-white/near-black. The live
-/// panel scores ~1.0; an unrelated heap mapping scores near 0. Used only to *validate*
-/// the positional pick below (not to hunt), so a blank white page still scores high.
+/// Read a strip at a candidate address and return the fraction of pixels that are
+/// grayscale (B≈G≈R) AND near-white — i.e. e-ink "paper". A real page (blank or inked)
+/// is predominantly white, scoring high; an all-black/garbage heap region scores ~0
+/// (crucially: near-black is NOT counted, or a zeroed region would look like all-ink).
+/// Used only to validate/rank framebuffer candidates.
 fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
     const SAMPLE_ROWS: usize = 300;
     if mem.seek(SeekFrom::Start(addr)).is_err() {
@@ -58,7 +59,7 @@ fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
     if mem.read_exact(&mut buf).is_err() {
         return -1.0;
     }
-    let (mut good, mut total) = (0u64, 0u64);
+    let (mut white, mut total) = (0u64, 0u64);
     let mut y = 0;
     while y < SAMPLE_ROWS {
         let ro = y * STRIDE as usize;
@@ -66,15 +67,15 @@ fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
         while x < WIDTH as usize {
             let o = ro + x * 4;
             let (b, g, r) = (buf[o] as i32, buf[o + 1] as i32, buf[o + 2] as i32);
-            if (b - g).abs() < 12 && (r - g).abs() < 12 && (g > 200 || g < 60) {
-                good += 1;
+            if (b - g).abs() < 12 && (r - g).abs() < 12 && g > 200 {
+                white += 1;
             }
             total += 1;
             x += 4;
         }
         y += 4;
     }
-    if total == 0 { 0.0 } else { good as f64 / total as f64 }
+    if total == 0 { 0.0 } else { white as f64 / total as f64 }
 }
 
 /// Find the framebuffer read address. The backing store is the first anonymous rw
@@ -124,7 +125,7 @@ pub fn find_capture_address(pid: i32) -> Result<u64> {
         }
     }
     if let Some(addr) = positional {
-        if screen_score(&mut mem, addr) >= 0.5 {
+        if screen_score(&mut mem, addr) >= 0.35 {
             return Ok(addr);
         }
     }
@@ -142,7 +143,7 @@ pub fn find_capture_address(pid: i32) -> Result<u64> {
             }
         }
     }
-    if best.0 >= 0.5 {
+    if best.0 >= 0.35 {
         return Ok(best.1);
     }
     bail!(
