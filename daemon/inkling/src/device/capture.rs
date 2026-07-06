@@ -45,13 +45,44 @@ pub fn find_xochitl_pid() -> Result<i32> {
     pid.parse::<i32>().context("parsing xochitl pid")
 }
 
-/// Find the read address. The framebuffer backing store is the first anonymous
-/// (unnamed) writable mapping *after* `/dev/fb0` in xochitl's maps that is large
-/// enough to actually hold `pointer_offset + one frame`. The original code always
-/// took the very next line, but after xochitl restarts the mapping order shifts and
-/// that line can be a small (~3.6 MB) unrelated region — reading from it returns
-/// garbage. Requiring the mapping to be big enough skips those and locks onto the
-/// real ~13 MB framebuffer. See device_report.md for the offset derivation.
+/// Read a strip at a candidate address and return the fraction of pixels that look
+/// like real e-ink content: grayscale (B≈G≈R) and near-white/near-black. The live
+/// panel scores ~1.0; an unrelated heap mapping scores near 0. Used only to *validate*
+/// the positional pick below (not to hunt), so a blank white page still scores high.
+fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
+    const SAMPLE_ROWS: usize = 300;
+    if mem.seek(SeekFrom::Start(addr)).is_err() {
+        return -1.0;
+    }
+    let mut buf = vec![0u8; SAMPLE_ROWS * STRIDE as usize];
+    if mem.read_exact(&mut buf).is_err() {
+        return -1.0;
+    }
+    let (mut good, mut total) = (0u64, 0u64);
+    let mut y = 0;
+    while y < SAMPLE_ROWS {
+        let ro = y * STRIDE as usize;
+        let mut x = 0;
+        while x < WIDTH as usize {
+            let o = ro + x * 4;
+            let (b, g, r) = (buf[o] as i32, buf[o + 1] as i32, buf[o + 2] as i32);
+            if (b - g).abs() < 12 && (r - g).abs() < 12 && (g > 200 || g < 60) {
+                good += 1;
+            }
+            total += 1;
+            x += 4;
+        }
+        y += 4;
+    }
+    if total == 0 { 0.0 } else { good as f64 / total as f64 }
+}
+
+/// Find the framebuffer read address. The backing store is the first anonymous rw
+/// mapping *after* `/dev/fb0` large enough to hold `pointer_offset + one frame`; on a
+/// clean boot that's the aligned ~13 MB panel (verified). After *many* xochitl restarts
+/// the mapping order can drift onto garbage, so we validate the pick with `screen_score`
+/// and, if it doesn't look like a screen, scan the other large anon mappings for one
+/// that does. A device reboot restores the clean aligned layout. See device_report.md.
 pub fn find_capture_address(pid: i32) -> Result<u64> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("reading /proc/pid/maps")?;
     let lines: Vec<&str> = maps.lines().collect();
@@ -67,9 +98,8 @@ pub fn find_capture_address(pid: i32) -> Result<u64> {
              firmware>=3.24 4bpp BGRA layout (device_report.md); re-run M0 recon on this OS version"
         );
     }
-    let need = pointer_offset + FRAME_BYTES as u64; // bytes we must be able to read from base
+    let need = pointer_offset + FRAME_BYTES as u64;
 
-    // Parse a maps line: "START-END perms offset dev inode [pathname]".
     let parse = |line: &str| -> Option<(u64, u64, bool)> {
         let mut it = line.split_whitespace();
         let range = it.next()?;
@@ -77,21 +107,48 @@ pub fn find_capture_address(pid: i32) -> Result<u64> {
         let (s, e) = range.split_once('-')?;
         let start = u64::from_str_radix(s, 16).ok()?;
         let end = u64::from_str_radix(e, 16).ok()?;
-        let anon = line.split_whitespace().nth(5).is_none(); // no pathname column
+        let anon = line.split_whitespace().nth(5).is_none();
         Some((start, end.saturating_sub(start), anon && perms.starts_with("rw")))
     };
 
+    let mut mem = fs::File::open(format!("/proc/{pid}/mem")).context("opening /proc/pid/mem")?;
+
+    // Primary: the first big anon mapping after fb0 (the aligned panel on a clean boot).
+    let mut positional = None;
     for line in &lines[fb0_idx + 1..] {
         if let Some((start, size, usable)) = parse(line) {
             if usable && size >= need {
-                return Ok(start + pointer_offset + 8);
+                positional = Some(start + pointer_offset + 8);
+                break;
             }
         }
     }
+    if let Some(addr) = positional {
+        if screen_score(&mut mem, addr) >= 0.5 {
+            return Ok(addr);
+        }
+    }
+
+    // Fallback (drifted layout): validate any large anon mapping and take the best.
+    let mut best = (-1.0f64, 0u64);
+    for line in &lines {
+        if let Some((start, size, usable)) = parse(line) {
+            if usable && size >= need {
+                let addr = start + pointer_offset + 8;
+                let s = screen_score(&mut mem, addr);
+                if s > best.0 {
+                    best = (s, addr);
+                }
+            }
+        }
+    }
+    if best.0 >= 0.5 {
+        return Ok(best.1);
+    }
     bail!(
-        "no anonymous writable mapping large enough for a frame ({} bytes) found after /dev/fb0 — \
-         framebuffer layout may have changed (see device_report.md); a fresh xochitl restart usually re-aligns it",
-        need
+        "no framebuffer-looking mapping found after /dev/fb0 (best screen-score {:.2}); \
+         the memory layout has drifted — a device reboot restores the aligned framebuffer",
+        best.0
     )
 }
 
