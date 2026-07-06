@@ -389,7 +389,9 @@ fn draw_loading_hourglass(pen: &mut VirtualPen, calibration: &AffineTransform, p
 fn animate_loading(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64, frame: u32) {
     use inkling_core::geometry::Stroke;
     let (cx, cy) = (LOAD_CX, LOAD_CY);
-    let (r0, r1) = (110.0_f32, 140.0_f32);
+    // Ring sits well clear of the hourglass corners (~104px from centre) so the
+    // spinner ticks don't crowd it.
+    let (r0, r1) = (150.0_f32, 180.0_f32);
     let ang = (frame % 12) as f32 * std::f32::consts::TAU / 12.0;
     let (ca, sa) = (ang.cos(), ang.sin());
     let mut s = Stroke::new();
