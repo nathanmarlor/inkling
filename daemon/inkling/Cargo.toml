@@ -1,14 +1,14 @@
 [package]
-name = "scribed"
+name = "inkling"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "scribed"
+name = "inkling"
 path = "src/main.rs"
 
 [dependencies]
-scribed-core = { path = "../scribed-core" }
+inkling-core = { path = "../inkling-core" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

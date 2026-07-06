@@ -5,10 +5,10 @@ mod imagegen;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use scribed_core::vector::{vectorize, VectorizeOptions, VectorizeResult};
+use inkling_core::vector::{vectorize, VectorizeOptions, VectorizeResult};
 
 #[derive(Parser)]
-#[command(name = "scribed")]
+#[command(name = "inkling")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,14 +32,14 @@ enum Commands {
     /// Auto-calibrate the display<->pen transform: injects 3 small marks,
     /// captures after each, solves the affine, saves it (on-device only).
     Calibrate {
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         out: String,
     },
     /// Draw a test square+diagonal in display space (on-device only).
     DrawTest {
         #[arg(long, default_value_t = 4000.0)]
         pps: f64,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// Debug which injection path reaches the screen: uinput virtual
@@ -48,13 +48,13 @@ enum Commands {
     /// Run the magic-notebook daemon: watch for finished sketches, generate
     /// illustrations, dissolve, redraw (on-device only).
     Run {
-        #[arg(long, default_value = "/home/root/.config/scribed/config.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/config.toml")]
         config: String,
     },
     /// Measure the injected eraser band width: draw a filled block, sweep one
     /// eraser line through it, report the cleared band height (on-device only).
     EraseProbe {
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// "White box" wipe: fill the drawing area with the eraser in columns
@@ -62,7 +62,7 @@ enum Commands {
     Wipe {
         #[arg(long, default_value_t = 8000.0)]
         pps: f64,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// Inject a lasso loop around the whole page with the NIB — if xochitl's
@@ -71,7 +71,7 @@ enum Commands {
     Lasso {
         #[arg(long, default_value_t = 2000.0)]
         pps: f64,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// Progressive dithered fade: erase the page in scattered patches over
@@ -81,7 +81,7 @@ enum Commands {
         pps: f64,
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// Erase all ink on the page in scattered dissolve order (on-device only).
@@ -94,7 +94,7 @@ enum Commands {
         pps: f64,
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
     },
     /// Vectorize an image and draw it on the current page via the virtual
@@ -105,7 +105,7 @@ enum Commands {
         pps: f64,
         #[arg(long, default_value_t = 16000)]
         max_points: usize,
-        #[arg(long, default_value = "/home/root/.config/scribed/calibration.toml")]
+        #[arg(long, default_value = "/home/root/.config/inkling/calibration.toml")]
         calibration: String,
         /// Input image is in landscape orientation (rotated to portrait
         /// before drawing so it reads correctly when the tablet is held
@@ -215,7 +215,7 @@ fn preview_vectorize(input: &str, out: &str, page_width: u32) -> Result<()> {
     let img = img.resize(page_width, u32::MAX, image::imageops::FilterType::Lanczos3).to_luma8();
     let tonal = std::env::var("SCRIBED_TONAL").is_ok();
     let result = if tonal {
-        scribed_core::vector::vectorize_tonal(&img, &scribed_core::vector::TonalOptions::default())
+        inkling_core::vector::vectorize_tonal(&img, &inkling_core::vector::TonalOptions::default())
     } else {
         vectorize(&img, &VectorizeOptions::default())
     };
@@ -329,7 +329,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
 pub mod on_device {
     use super::*;
     use crate::device::{capture as cap, uinput::{Tool, VirtualPen}};
-    use scribed_core::geometry::{AffineTransform, PointPx, PenUnits, Stroke};
+    use inkling_core::geometry::{AffineTransform, PointPx, PenUnits, Stroke};
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -339,7 +339,7 @@ pub mod on_device {
 
     pub fn load_calibration(path: &str) -> Result<AffineTransform> {
         let s = std::fs::read_to_string(path)
-            .with_context(|| format!("reading calibration {path} — run `scribed calibrate` first"))?;
+            .with_context(|| format!("reading calibration {path} — run `inkling calibrate` first"))?;
         let v: toml::Value = s.parse().context("parsing calibration toml")?;
         let arr = v
             .get("display_to_pen")
@@ -355,7 +355,7 @@ pub mod on_device {
             std::fs::create_dir_all(dir)?;
         }
         let body = format!(
-            "# scribed display->pen affine, written by `scribed calibrate`\ndisplay_to_pen = [{}, {}, {}, {}, {}, {}]\n",
+            "# inkling display->pen affine, written by `inkling calibrate`\ndisplay_to_pen = [{}, {}, {}, {}, {}, {}]\n",
             t.a, t.b, t.c, t.d, t.e, t.f
         );
         std::fs::write(path, body).with_context(|| format!("writing {path}"))
@@ -462,7 +462,7 @@ pub mod on_device {
             let steps = (dist / spacing).ceil().max(1.0) as usize;
             for i in 1..=steps {
                 let t = i as f32 / steps as f32;
-                out.points.push(scribed_core::geometry::StrokePoint {
+                out.points.push(inkling_core::geometry::StrokePoint {
                     x: a.x + (b.x - a.x) * t,
                     y: a.y + (b.y - a.y) * t,
                     pressure: a.pressure + (b.pressure - a.pressure) * t,
@@ -608,7 +608,7 @@ pub mod on_device {
                     let mut v = Vec::new();
                     let mut x = cx - half;
                     while x <= cx + half {
-                        let pen_u = t.apply(scribed_core::geometry::PointPx::new(x, y));
+                        let pen_u = t.apply(inkling_core::geometry::PointPx::new(x, y));
                         v.push((pen_u.x, pen_u.y, 2400));
                         x += 3.0;
                     }
@@ -630,7 +630,7 @@ pub mod on_device {
                 let mut v = Vec::new();
                 let mut x = cx - half - 30.0;
                 while x <= cx + half + 30.0 {
-                    let pen_u = t.apply(scribed_core::geometry::PointPx::new(x, cy));
+                    let pen_u = t.apply(inkling_core::geometry::PointPx::new(x, cy));
                     v.push((pen_u.x, pen_u.y, 2400));
                     x += 3.0;
                 }

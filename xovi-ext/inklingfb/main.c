@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
-// scribefb — clean page-clear for the Magic Notebook, using xochitl's own scene.
+// inklingfb — clean page-clear for the Magic Notebook, using xochitl's own scene.
 //
 // Hook-free and stable (no QMetaObject::activate hooks — those crash xovi's arm32
 // trampoline). On trigger it walks the live QtQuick VISUAL tree to the active page's
@@ -14,7 +14,7 @@
 // update() on the scene views to refresh the panel. xochitl performs the erase and
 // e-ink refresh itself — this is why it sidesteps the framebuffer-swap problem.
 //
-//   Trigger:  touch /tmp/scribefb_clear     (deleted after handling)
+//   Trigger:  touch /tmp/inklingfb_clear     (deleted after handling)
 //   Loads via xovi auto-load — plain LD_PRELOAD, no hooks, no kick shim.
 //   All Qt entry points are resolved by dlsym against libQt6Core/Gui/Quick.
 //
@@ -101,13 +101,13 @@ static void clear_page(void){
     }
     for(int i=0;i<g_nviews;i++)
         p_invoke(g_views[i], "update", 2, z,z,z,z,z,z,z,z,z,z,z);            // refresh the panel
-    fprintf(stderr, "[scribefb] cleared page (%d controller(s), %d view(s))\n", g_nscs, g_nviews);
+    fprintf(stderr, "[inklingfb] cleared page (%d controller(s), %d view(s))\n", g_nscs, g_nviews);
 }
 
 static void* watcher(void* _){
     (void)_;
     for(;;){
-        if(access("/tmp/scribefb_clear", F_OK)==0){ clear_page(); unlink("/tmp/scribefb_clear"); }
+        if(access("/tmp/inklingfb_clear", F_OK)==0){ clear_page(); unlink("/tmp/inklingfb_clear"); }
         usleep(120000);
     }
     return 0;
@@ -121,6 +121,6 @@ void _xovi_construct(void){
     p_childitems  = (childitems_fn) dlsym(RTLD_DEFAULT,"_ZNK10QQuickItem10childItemsEv");
     p_qproperty   = (qproperty_fn) dlsym(RTLD_DEFAULT,"_ZNK7QObject8propertyEPKc");
     g_qobj_smo    = dlsym(RTLD_DEFAULT,"_ZN7QObject16staticMetaObjectE");
-    fprintf(stderr, "[scribefb] loaded (page-clear via SceneController)\n");
+    fprintf(stderr, "[inklingfb] loaded (page-clear via SceneController)\n");
     pthread_t t; pthread_create(&t, NULL, watcher, NULL);
 }

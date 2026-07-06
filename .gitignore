@@ -5,7 +5,7 @@ config.toml
 config.local.toml
 
 # rust build artifacts
-scribed/target/
+daemon/target/
 
 # extension build artifacts
 *.o

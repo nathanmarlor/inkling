@@ -1,6 +1,6 @@
 //! Grayscale ink surface for TAKEOVER display mode.
 //!
-//! In takeover mode scribed owns the e-ink panel (xochitl stopped, panel
+//! In takeover mode inkling owns the e-ink panel (xochitl stopped, panel
 //! driven via rm2fb/SWTCON), so "ink" is just our own 8-bit grayscale buffer
 //! that we push to the display. That ownership is what makes a true per-pixel
 //! fade possible — impossible inside xochitl, where ink is binary document

@@ -1,14 +1,14 @@
-//! On/off toggle gesture for scribed itself.
+//! On/off toggle gesture for inkling itself.
 //!
 //! xochitl is closed-source Qt6 — we cannot add a real button to its side
 //! toolbar. The practical equivalent: double-tap a fixed screen zone (placed
 //! over/near where xochitl's own tool-icon column sits, so it *feels* like
-//! part of the toolbar) to flip scribed's paused/active state. This reuses
+//! part of the toolbar) to flip inkling's paused/active state. This reuses
 //! the pause-file mechanism from DESIGN.md §9 as the actual on/off switch —
 //! this detector just decides *when* to flip it from a touch stream.
 //!
 //! Deliberately separate from `watch::SessionWatcher`: this toggles whether
-//! scribed is watching at all, not whether a single request should fire.
+//! inkling is watching at all, not whether a single request should fire.
 
 use crate::geometry::{PointPx, RectPx};
 

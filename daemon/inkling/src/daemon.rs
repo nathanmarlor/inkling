@@ -11,13 +11,11 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::{Context, Result};
-use scribed_core::dissolve::{plan_dissolve, InkMask};
-use scribed_core::geometry::AffineTransform;
-use scribed_core::watch::{count_new_ink, PenEvent, SessionWatcher};
+use inkling_core::dissolve::{plan_dissolve, InkMask};
+use inkling_core::geometry::AffineTransform;
+use inkling_core::watch::{count_new_ink, PenEvent, SessionWatcher};
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::device::capture as cap;
@@ -59,9 +57,9 @@ impl Default for DaemonConfig {
             // Keep the erase rate in the reliable band.
             erase_pps: 2000.0,
             max_points: 30000,
-            calibration_path: "/home/root/.config/scribed/calibration.toml".into(),
-            archive_dir: "/home/root/.local/share/scribed/archive".into(),
-            pause_file: "/home/root/.config/scribed/pause".into(),
+            calibration_path: "/home/root/.config/inkling/calibration.toml".into(),
+            archive_dir: "/home/root/.local/share/inkling/archive".into(),
+            pause_file: "/home/root/.config/inkling/pause".into(),
         }
     }
 }
@@ -72,10 +70,10 @@ impl Default for DaemonConfig {
 /// so a capture taken right after erasing reads stale ink and would loop
 /// forever; the erase itself lands, as verified on-device).
 ///
-/// The injected eraser band is 14px wide (`scribed erase-probe`); spacing 10
+/// The injected eraser band is 14px wide (`inkling erase-probe`); spacing 10
 /// with two phase-offset passes guarantees gap-free coverage.
 pub fn dissolve_page(calibration: &AffineTransform, erase_pps: f64, _seed: u64) -> Result<()> {
-    use scribed_core::geometry::Stroke;
+    use inkling_core::geometry::Stroke;
 
     const CORNER: u32 = 180;
     const BAND_SPACING: f32 = 9.0; // < 14px eraser band, generous overlap
@@ -141,7 +139,7 @@ pub fn dissolve_page(calibration: &AffineTransform, erase_pps: f64, _seed: u64) 
 /// `stages`: >1 spreads the erase over that many scattered beats (the fade);
 /// 1 wipes in a single pass.
 pub fn fade_page(calibration: &AffineTransform, erase_pps: f64, seed: u64) -> Result<()> {
-    use scribed_core::vector::{simplify, thin_zhang_suen, trace_skeleton, Pt};
+    use inkling_core::vector::{simplify, thin_zhang_suen, trace_skeleton, Pt};
     const CORNER: u32 = 180;
     const STAGES: usize = 6;
 
@@ -189,7 +187,7 @@ pub fn fade_page(calibration: &AffineTransform, erase_pps: f64, seed: u64) -> Re
         let mut pen = VirtualPen::open_existing(PEN_NODE)?;
         pen.tool_in(Tool::Rubber)?;
         for line in &lines[done..target] {
-            let mut stroke = scribed_core::geometry::Stroke::new();
+            let mut stroke = inkling_core::geometry::Stroke::new();
             for p in line {
                 stroke.push(p.x, p.y, 0.9);
             }
@@ -249,7 +247,7 @@ pub fn fade_page(calibration: &AffineTransform, erase_pps: f64, seed: u64) -> Re
 /// including solid dark areas that line-tracing misses. Reads as a white wipe
 /// sweeping left to right.
 pub fn wipe_page(calibration: &AffineTransform, erase_pps: f64) -> Result<()> {
-    use scribed_core::geometry::Stroke;
+    use inkling_core::geometry::Stroke;
     const CORNER: u32 = 180;
     const COL_SPACING: f32 = 10.0; // < 12px eraser band → full coverage
     const PAD: f32 = 14.0;
@@ -297,7 +295,15 @@ pub fn wipe_page(calibration: &AffineTransform, erase_pps: f64) -> Result<()> {
     Ok(())
 }
 
-/// Raw 16-byte input_event parse (armv7: two u32 timestamps).
+// The 16-byte layout below assumes a 32-bit `struct input_event`: an 8-byte
+// `timeval` (two 32-bit words) followed by u16 type, u16 code, i32 value. That
+// holds on the armv7 target this daemon runs on; on a 64-bit target `timeval`
+// is 16 bytes and these offsets would be wrong, so fail the build loudly rather
+// than silently misparse pen events.
+#[cfg(not(target_pointer_width = "32"))]
+compile_error!("parse_event assumes a 32-bit input_event layout (armv7); build for a 32-bit target");
+
+/// Raw 16-byte input_event parse (type at 8, code at 10, value at 12).
 fn parse_event(buf: &[u8; 16]) -> (u16, u16, i32) {
     let type_ = u16::from_ne_bytes([buf[8], buf[9]]);
     let code = u16::from_ne_bytes([buf[10], buf[11]]);
@@ -314,9 +320,9 @@ fn set_nonblocking(fd: i32) -> Result<()> {
     Ok(())
 }
 
-/// Trigger file watched by the `scribefb` xovi extension inside xochitl. Touching
+/// Trigger file watched by the `inklingfb` xovi extension inside xochitl. Touching
 /// it makes xochitl clear the current page (ink + text) and refresh the panel.
-const CLEAR_TRIGGER: &str = "/tmp/scribefb_clear";
+const CLEAR_TRIGGER: &str = "/tmp/inklingfb_clear";
 
 /// A mid-refresh or mis-addressed framebuffer read shows up as a band of random
 /// mid-grey noise; a real e-ink page is almost entirely near-white with crisp
@@ -332,9 +338,25 @@ fn looks_like_garbage(img: &image::GrayImage) -> bool {
 }
 
 /// Clear the page via xochitl's own SceneController (the clean native clear).
-/// Falls back silently if the extension isn't loaded (the file just lingers).
+/// The extension deletes the trigger file once it has handled the clear, so we
+/// poll for that as a liveness check: if it's still there after the timeout the
+/// extension isn't loaded/responding, which we log rather than silently redraw
+/// on top of the old page. Either way we give the e-ink time to settle.
 fn native_clear() -> Result<()> {
+    let _ = std::fs::remove_file(CLEAR_TRIGGER); // clear any stale trigger first
     std::fs::write(CLEAR_TRIGGER, b"")?;
+    let deadline = Instant::now() + Duration::from_millis(900);
+    let mut consumed = false;
+    while Instant::now() < deadline {
+        if !std::path::Path::new(CLEAR_TRIGGER).exists() {
+            consumed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !consumed {
+        log::warn!("native clear: inklingfb did not consume {CLEAR_TRIGGER} within 900ms — is the extension loaded?");
+    }
     std::thread::sleep(Duration::from_millis(600)); // let the e-ink refresh settle
     Ok(())
 }
@@ -347,7 +369,7 @@ const LOAD_CY: f32 = 936.0;
 /// Draw the hourglass outline once — a "working…" indicator so the wait for the
 /// illustration isn't a dead blank screen.
 fn draw_loading_hourglass(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64) -> Result<()> {
-    use scribed_core::geometry::Stroke;
+    use inkling_core::geometry::Stroke;
     let (cx, cy) = (LOAD_CX, LOAD_CY);
     let (w, h) = (85.0_f32, 60.0_f32);
     // TL -> BL -> TR -> BR -> TL: vertical left/right edges with crossing diagonals.
@@ -365,7 +387,7 @@ fn draw_loading_hourglass(pen: &mut VirtualPen, calibration: &AffineTransform, p
 /// repeatedly while generating, they sweep round like a loading spinner. Circular
 /// so it's rotation-agnostic; additive (cleared with everything before the redraw).
 fn animate_loading(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64, frame: u32) {
-    use scribed_core::geometry::Stroke;
+    use inkling_core::geometry::Stroke;
     let (cx, cy) = (LOAD_CX, LOAD_CY);
     let (r0, r1) = (110.0_f32, 140.0_f32);
     let ang = (frame % 12) as f32 * std::f32::consts::TAU / 12.0;
@@ -383,16 +405,14 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     // Single-instance guard. Two daemons would each see the other's drawn
     // illustration as fresh user ink and trigger each other in an endless loop
     // (and double-bill the API). Hold an exclusive lock for our whole lifetime.
-    let lock = std::fs::OpenOptions::new().create(true).write(true).open("/tmp/scribed.lock")
-        .context("opening /tmp/scribed.lock")?;
+    let lock = std::fs::OpenOptions::new().create(true).write(true).open("/tmp/inkling.lock")
+        .context("opening /tmp/inkling.lock")?;
     let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    anyhow::ensure!(locked, "another scribed daemon is already running (/tmp/scribed.lock is held) — refusing to start a second");
+    anyhow::ensure!(locked, "another inkling daemon is already running (/tmp/inkling.lock is held) — refusing to start a second");
     std::mem::forget(lock); // keep the fd (and the lock) for the process lifetime
     let calibration = crate::on_device::load_calibration(&config.calibration_path)?;
     let client = OpenRouterClient::new(config.api_key.clone(), config.model.clone());
     std::fs::create_dir_all(&config.archive_dir).ok();
-
-    let injecting = Arc::new(AtomicBool::new(false));
 
     let mut event_file = std::fs::File::open(PEN_NODE).with_context(|| format!("opening {PEN_NODE} for watching"))?;
     set_nonblocking(event_file.as_raw_fd())?;
@@ -404,7 +424,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
 
     // Baseline for the new-ink gate: whatever is on screen at startup.
     let mut baseline = cap::capture_now()?;
-    log::info!("scribed daemon started (dwell {}s, model {})", config.dwell_s, config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL));
+    log::info!("inkling daemon started (dwell {}s, model {})", config.dwell_s, config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL));
 
     let mut buf = [0u8; 16];
     loop {
@@ -412,9 +432,6 @@ pub fn run(config: DaemonConfig) -> Result<()> {
         loop {
             match event_file.read(&mut buf) {
                 Ok(16) => {
-                    if injecting.load(Ordering::Relaxed) {
-                        continue; // our own strokes
-                    }
                     let (type_, code, value) = parse_event(&buf);
                     if type_ == EV_KEY {
                         let now = started.elapsed().as_secs_f64();
@@ -445,7 +462,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
             // so rate_limit_s did nothing). It's the universal backoff that stops
             // a failed or garbage cycle from re-firing on the very next 50 ms tick.
             watcher.begin_asking(now);
-            match run_cycle(&config, &client, &calibration, &injecting, &baseline) {
+            match run_cycle(&config, &client, &calibration, &baseline) {
                 Ok(Outcome::Drawn(new_baseline)) => {
                     baseline = new_baseline;
                     watcher.complete_cycle(true);
@@ -468,8 +485,12 @@ pub fn run(config: DaemonConfig) -> Result<()> {
                     watcher.complete_cycle(false);
                 }
             }
-            // Drain everything queued during the cycle (mostly our own
-            // injected events) before resuming the watch.
+            // Our stroke injection writes to the same evdev node we watch, so the
+            // kernel echoes those events back to us. Discard everything queued
+            // during the cycle (our own injected strokes, the restored sketch, the
+            // hourglass) so our own drawing isn't mistaken for the user resuming.
+            // Genuine new user ink is still caught by the capture-based new-ink
+            // gate on the next cycle, so nothing is lost by discarding here.
             while let Ok(16) = event_file.read(&mut buf) {}
         }
 
@@ -493,7 +514,7 @@ enum Outcome {
 /// onto the page as pen strokes. Used for both the illustration and, on failure,
 /// restoring the user's sketch.
 fn draw_png(png: &[u8], calibration: &AffineTransform, config: &DaemonConfig) -> Result<()> {
-    let tmp = "/tmp/scribed_draw.png";
+    let tmp = "/tmp/inkling_draw.png";
     std::fs::write(tmp, png)?;
     let (vec_result, _, _) = crate::vectorize_for_page(tmp, true, config.max_points)?;
     std::thread::sleep(Duration::from_millis(100));
@@ -551,7 +572,6 @@ fn run_cycle(
     config: &DaemonConfig,
     client: &OpenRouterClient,
     calibration: &AffineTransform,
-    injecting: &Arc<AtomicBool>,
     baseline: &image::GrayImage,
 ) -> Result<Outcome> {
     let sketch = cap::capture_now()?;
@@ -590,7 +610,6 @@ fn run_cycle(
         });
     }
 
-    injecting.store(true, Ordering::Relaxed);
     let result = (|| -> Result<image::GrayImage> {
         // Clear the sketch and show the hourglass, overlapping the API round-trip.
         native_clear()?;
@@ -615,6 +634,5 @@ fn run_cycle(
             Err(e)
         }
     };
-    injecting.store(false, Ordering::Relaxed);
     outcome
 }

@@ -15,24 +15,24 @@ the finished thing comes back.
 
 Three pieces:
 
-- **`scribed`** — a small Rust daemon that runs on the tablet. It watches the pen for
+- **`inkling`** — a small Rust daemon that runs on the tablet. It watches the pen for
   when you've *finished* a sketch (a short quiet period after you stop drawing and lift
   the pen), grabs the current page, sends it to an image model, clears the page, and
   draws the result back as real pen strokes.
-- **`scribefb`** — a tiny [xovi](https://github.com/asivery/xovi) extension that clears
+- **`inklingfb`** — a tiny [xovi](https://github.com/asivery/xovi) extension that clears
   the current page cleanly by driving the tablet UI's own scene, so the device repaints
   the e-ink panel itself. This replaces the crude "erase everything with the eraser
   tool" approach and is instant and undoable.
-- **`scribed-core`** — the pure, host-testable logic (the finished-sketch state machine,
+- **`inkling-core`** — the pure, host-testable logic (the finished-sketch state machine,
   the raster→pen-stroke vectorizer, geometry/calibration). No device dependencies, unit
   tested.
 
 The loop:
 
 ```
-you draw ─▶ scribed detects you finished ─▶ capture the page
+you draw ─▶ inkling detects you finished ─▶ capture the page
          ─▶ image model turns the sketch into a clean illustration
-         ─▶ scribefb clears the page ─▶ scribed redraws the result as pen strokes
+         ─▶ inklingfb clears the page ─▶ inkling redraws the result as pen strokes
 ```
 
 If you pick the pen back up mid-cycle, the request is abandoned and the page is left
@@ -55,21 +55,21 @@ exactly as you drew it.
 **Daemon** (static musl binary for the tablet):
 
 ```sh
-cd scribed
-cargo build --release --target armv7-unknown-linux-musleabihf -p scribed
-# → target/armv7-unknown-linux-musleabihf/release/scribed
-cargo test -p scribed-core        # run the pure-logic tests on your host
+cd daemon
+cargo build --release --target armv7-unknown-linux-musleabihf -p inkling
+# → target/armv7-unknown-linux-musleabihf/release/inkling
+cargo test -p inkling-core        # run the pure-logic tests on your host
 ```
 
 **Extension** (see [`xovi-ext/README.md`](xovi-ext/README.md) for details):
 
 ```sh
-cd xovi-ext/scribefb
-python3 xovi/util/xovigen.py -o xovi.c -H xovi.h scribefb.xovi
+cd xovi-ext/inklingfb
+python3 xovi/util/xovigen.py -o xovi.c -H xovi.h inklingfb.xovi
 CC=armv7-unknown-linux-gnueabihf-gcc
 $CC -std=gnu11 -D_GNU_SOURCE -fPIC -c main.c -o main.o
 $CC -std=gnu11 -D_GNU_SOURCE -fPIC -c xovi.c  -o xovi.o
-$CC -shared -o scribefb.so main.o xovi.o -lpthread
+$CC -shared -o inklingfb.so main.o xovi.o -lpthread
 ```
 
 ## Install & run
@@ -81,12 +81,12 @@ restarts the UI:
 RM2_HOST=<tablet-ip> RM2_PASS='<root-password>' ./xovi-ext/deploy.sh
 ```
 
-Then create the config (see below) at `/home/root/.config/scribed/config.toml`, run a
+Then create the config (see below) at `/home/root/.config/inkling/config.toml`, run a
 one-time calibration, and start the daemon:
 
 ```sh
-ssh root@<tablet-ip> ./scribed calibrate        # follow the on-screen taps
-ssh root@<tablet-ip> systemctl start scribed     # or run ./scribed run directly
+ssh root@<tablet-ip> ./inkling calibrate        # follow the on-screen taps
+ssh root@<tablet-ip> systemctl start inkling     # or run ./inkling run directly
 ```
 
 Now draw something and lift the pen.

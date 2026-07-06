@@ -1,11 +1,11 @@
 [package]
-name = "scribed-core"
+name = "inkling-core"
 version.workspace = true
 edition.workspace = true
 
 # Platform-independent logic only: geometry, config schema, session-watcher
 # state machine, dissolve planner, vectorizer. No evdev/uinput/proc-fs here —
-# that lives in the `scribed` binary crate behind cfg(target_os = "linux").
+# that lives in the `inkling` binary crate behind cfg(target_os = "linux").
 # Kept separate so this crate builds and its tests run on any dev machine.
 
 [dependencies]

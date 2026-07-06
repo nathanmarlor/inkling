@@ -14,9 +14,9 @@ pub const HEIGHT: u32 = 1872;
 const STRIDE: u64 = WIDTH as u64 * 4;
 const FRAME_BYTES: usize = (WIDTH as u64 * HEIGHT as u64 * 4) as usize;
 
-// NOTE: an in-xochitl capture path (scribefb extension hooking the QImage ctor to
+// NOTE: an in-xochitl capture path (inklingfb extension hooking the QImage ctor to
 // hand us its live panel buffer) was tried and reverted — hooking that hot, threaded
-// ctor destabilises xochitl's renderer (see xovi-ext/scribefb/main.c). Capture stays
+// ctor destabilises xochitl's renderer (see xovi-ext/inklingfb/main.c). Capture stays
 // here, reading the framebuffer out of xochitl's /proc/pid/mem.
 
 fn firmware_bytes_per_pixel_and_offset() -> Result<(u64, u64)> {

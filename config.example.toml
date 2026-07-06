@@ -1,4 +1,4 @@
-# Copy to /home/root/.config/scribed/config.toml on the tablet and fill in your key.
+# Copy to /home/root/.config/inkling/config.toml on the tablet and fill in your key.
 
 [imagegen]
 api_key = "sk-or-REPLACE-ME"          # your OpenRouter API key

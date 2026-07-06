@@ -1,5 +1,5 @@
 //! Platform-independent core of the Magic Notebook Illustrator daemon.
-//! No evdev/uinput/proc-fs access lives here — see the `scribed` binary
+//! No evdev/uinput/proc-fs access lives here — see the `inkling` binary
 //! crate's `device` module for that. Kept separate so this crate builds
 //! and its tests run on any machine (DESIGN.md M2 is explicitly "no device
 //! needed", and the watcher/dissolve/config logic benefits the same way).

@@ -17,7 +17,7 @@
 //!   ABS_DISTANCE 0..255
 //!   ABS_TILT_X/Y -9000..9000
 //! Exact axis orientation/flips display<->pen come from the empirical
-//! calibration pass (`scribed calibrate`), never assumed.
+//! calibration pass (`inkling calibrate`), never assumed.
 //!
 //! Speed model for the "rapid draw" effect: events are batched (many
 //! input_event structs per write() syscall) and paced by a points-per-second
@@ -34,7 +34,7 @@ use std::os::unix::io::AsRawFd;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use scribed_core::geometry::{AffineTransform, PointPx, Stroke};
+use inkling_core::geometry::{AffineTransform, PointPx, Stroke};
 
 // --- input-event-codes.h (stable kernel ABI) ---
 const EV_SYN: u16 = 0x00;
@@ -208,7 +208,7 @@ impl VirtualPen {
             }
 
             let mut name = [0u8; UINPUT_MAX_NAME_SIZE];
-            let n = b"scribed-virtual-pen";
+            let n = b"inkling-virtual-pen";
             name[..n.len()].copy_from_slice(n);
             let setup = UinputSetup {
                 id: InputId { bustype: 0x18 /* BUS_I2C, same as the real digitizer */, vendor: 0x2d1f, product: 0x0095, version: 1 },
