@@ -1,0 +1,15 @@
+# secrets — never commit
+secrets/
+*.key
+config.toml
+config.local.toml
+
+# rust build artifacts
+scribed/target/
+
+# extension build artifacts
+*.o
+*.so
+
+# OS
+.DS_Store

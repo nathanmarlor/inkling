@@ -1,0 +1,18 @@
+[package]
+name = "scribed-core"
+version.workspace = true
+edition.workspace = true
+
+# Platform-independent logic only: geometry, config schema, session-watcher
+# state machine, dissolve planner, vectorizer. No evdev/uinput/proc-fs here —
+# that lives in the `scribed` binary crate behind cfg(target_os = "linux").
+# Kept separate so this crate builds and its tests run on any dev machine.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.8"
+rand_pcg = "0.3"
+
+[dev-dependencies]

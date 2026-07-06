@@ -1,0 +1,20 @@
+# Copy to /home/root/.config/scribed/config.toml on the tablet and fill in your key.
+
+[imagegen]
+api_key = "sk-or-REPLACE-ME"          # your OpenRouter API key
+model   = "google/gemini-2.5-flash-image"
+
+[watch]
+dwell_s        = 3.0                    # quiet seconds after you stop drawing before it fires
+rate_limit_s   = 15.0                   # minimum gap between requests
+min_new_ink_px = 400                    # ignore trivial marks (pixels of fresh ink)
+
+[ink]
+draw_pps   = 800.0                      # pen-stroke injection speed (points/sec)
+max_points = 6000                       # cap on injected points per illustration
+
+[archive]
+dir = "/home/root/.local/share/inkling" # keeps a copy of each sketch + result
+
+[control]
+pause_file = "/tmp/inkling.pause"       # touch this file to pause the daemon
