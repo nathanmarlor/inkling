@@ -116,6 +116,46 @@ dir = "/home/root/.local/share/inkling"   # keeps sketch+result pairs
 pause_file = "/tmp/inkling.pause"      # touch this to pause the daemon
 ```
 
+## Technical notes
+
+Bits that might be useful if you're hacking on a reMarkable 2 (OS 3.x, Qt 6, `xochitl`).
+None of this needs the device opened up or a special developer mode — just root SSH.
+
+**Injecting pen strokes.** A hotplugged `uinput` device doesn't work — `xochitl` ignores
+it. You have to write `input_event`s directly into the *real* digitizer node
+(`/dev/input/event1`), Wacom-style (`ABS_X`/`ABS_Y` + pressure + `BTN_TOOL_PEN`).
+Screen→pen coordinates are a per-device affine transform, so there's a one-time
+`calibrate` step that drops three marks and reads back where they landed.
+
+**Reading the screen.** There's no QPA screengrab, and `/dev/fb0` on the rM2 is the raw
+LCDIF buffer, not what's on the panel. Instead, capture reads `xochitl`'s own backing
+image straight out of `/proc/<pid>/mem`: it's the first large anonymous read-write
+mapping after `/dev/fb0` in the process maps — portrait **1404×1872**, BGRA, **stride
+5616** (4 bytes/px on firmware ≥ 3.24). That mapping shifts after `xochitl` restarts, so
+the code locks onto it by size rather than a fixed address. (Technique originally from
+[ghostwriter](https://github.com/awwaiid/ghostwriter); geometry re-derived for this OS.)
+
+**Clearing the page.** rM2 ink is binary black strokes with no per-pixel alpha, so you
+can't "fade" it — the only white is the eraser tool. The clean approach is to drive
+`xochitl`'s *own* clear: the `inklingfb` [xovi](https://github.com/asivery/xovi) extension
+walks the live QtQuick **visual** tree (`QQuickItem::childItems`, from the window's
+`QQuickRootItem`) to the active page's `SceneController`, then invokes `clearLines` +
+`clearRootDocument` by name via `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`.
+`xochitl` performs the erase *and* the e-ink refresh itself — which matters because the
+rM2 has no hardware EPDC (the waveform/SWTCON lives in software inside `xochitl`), so
+third-party framebuffer writes never refresh the panel on their own. Bonus: the clear is
+undoable. Gotchas: only call `childItems()` on real `QQuickItem`s, and only marshal
+cross-thread calls with `QueuedConnection` — a blocking call from a worker thread
+deadlocks the UI and the watchdog reboots the device.
+
+**A dead end worth knowing.** You *can* grab the exact panel buffer by hooking the
+`QImage(uchar*, …)` constructor from a xovi extension (this is what
+[framebuffer-spy](https://github.com/asivery/rm-xovi-extensions) does). It works — but
+that ctor sits on `xochitl`'s hot, multi-threaded render path, and xovi wraps every
+hooked call in a per-symbol mutex and rewrites the function on each original-call, which
+serialised rendering enough to trip `xochitl`'s "Something went wrong" screen. We reverted
+it and kept capture in `/proc/mem`. If you retry, solve the render-path contention first.
+
 ## Privacy
 
 The daemon sends an image of the current page to the OpenRouter API to generate the
