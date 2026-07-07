@@ -45,70 +45,11 @@ pub fn find_xochitl_pid() -> Result<i32> {
     pid.parse::<i32>().context("parsing xochitl pid")
 }
 
-/// Read a strip at a candidate address and return the fraction of pixels that are
-/// grayscale (B≈G≈R) AND near-white — i.e. e-ink "paper". A real page (blank or inked)
-/// is predominantly white, scoring high; an all-black/garbage heap region scores ~0
-/// (crucially: near-black is NOT counted, or a zeroed region would look like all-ink).
-/// Used only to validate/rank framebuffer candidates.
-fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
-    const SAMPLE_ROWS: usize = 300;
-    if mem.seek(SeekFrom::Start(addr)).is_err() {
-        return -1.0;
-    }
-    let mut buf = vec![0u8; SAMPLE_ROWS * STRIDE as usize];
-    if mem.read_exact(&mut buf).is_err() {
-        return -1.0;
-    }
-    let (mut white, mut ink, mut total) = (0u64, 0u64, 0u64);
-    let (mut dup, mut dup_total) = (0u64, 0u64);
-    let half = WIDTH as usize / 2;
-    let mut y = 0;
-    while y < SAMPLE_ROWS {
-        let ro = y * STRIDE as usize;
-        let mut x = 0;
-        while x < WIDTH as usize {
-            let o = ro + x * 4;
-            let (b, g, r) = (buf[o] as i32, buf[o + 1] as i32, buf[o + 2] as i32);
-            let gray = (b - g).abs() < 12 && (r - g).abs() < 12;
-            if gray && g > 200 {
-                white += 1;
-            }
-            if gray && g < 100 {
-                ink += 1;
-            }
-            total += 1;
-            // Left/right equality: a 2 bytes/px buffer misread at 4 bytes/px tiles each
-            // row, so pixel x == pixel x+half everywhere.
-            if x < half {
-                let g2 = buf[ro + (x + half) * 4 + 1] as i32;
-                if (g - g2).abs() < 4 {
-                    dup += 1;
-                }
-                dup_total += 1;
-            }
-            x += 4;
-        }
-        y += 4;
-    }
-    if total == 0 {
-        return 0.0;
-    }
-    let dup_frac = if dup_total == 0 { 0.0 } else { dup as f64 / dup_total as f64 };
-    let ink_frac = ink as f64 / total as f64;
-    // A tiled decoy has near-perfect left/right equality AND real content. A genuinely
-    // blank page is also left/right-equal but has ~no ink, so don't reject that.
-    if dup_frac > 0.9 && ink_frac > 0.02 {
-        return 0.0;
-    }
-    white as f64 / total as f64
-}
-
-/// Find the framebuffer read address. The backing store is the first anonymous rw
-/// mapping *after* `/dev/fb0` large enough to hold `pointer_offset + one frame`; on a
-/// clean boot that's the aligned ~13 MB panel (verified). After *many* xochitl restarts
-/// the mapping order can drift onto garbage, so we validate the pick with `screen_score`
-/// and, if it doesn't look like a screen, scan the other large anon mappings for one
-/// that does. A device reboot restores the clean aligned layout. See device_report.md.
+/// Find the framebuffer read address: the first anonymous rw mapping *after*
+/// `/dev/fb0` large enough to hold `pointer_offset + one frame`. On a cleanly booted
+/// device that is the aligned panel (verified). NOTE: after many xochitl restarts the
+/// mapping order drifts and this can read garbage — use a fresh reboot for reliable
+/// capture. See device_report.md for the offset derivation.
 pub fn find_capture_address(pid: i32) -> Result<u64> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("reading /proc/pid/maps")?;
     let lines: Vec<&str> = maps.lines().collect();
@@ -137,44 +78,16 @@ pub fn find_capture_address(pid: i32) -> Result<u64> {
         Some((start, end.saturating_sub(start), anon && perms.starts_with("rw")))
     };
 
-    let mut mem = fs::File::open(format!("/proc/{pid}/mem")).context("opening /proc/pid/mem")?;
-
-    // Primary: the first big anon mapping after fb0 (the aligned panel on a clean boot).
-    let mut positional = None;
     for line in &lines[fb0_idx + 1..] {
         if let Some((start, size, usable)) = parse(line) {
             if usable && size >= need {
-                positional = Some(start + pointer_offset + 8);
-                break;
+                return Ok(start + pointer_offset + 8);
             }
         }
-    }
-    if let Some(addr) = positional {
-        if screen_score(&mut mem, addr) >= 0.35 {
-            return Ok(addr);
-        }
-    }
-
-    // Fallback (drifted layout): validate any large anon mapping and take the best.
-    let mut best = (-1.0f64, 0u64);
-    for line in &lines {
-        if let Some((start, size, usable)) = parse(line) {
-            if usable && size >= need {
-                let addr = start + pointer_offset + 8;
-                let s = screen_score(&mut mem, addr);
-                if s > best.0 {
-                    best = (s, addr);
-                }
-            }
-        }
-    }
-    if best.0 >= 0.35 {
-        return Ok(best.1);
     }
     bail!(
-        "no framebuffer-looking mapping found after /dev/fb0 (best screen-score {:.2}); \
-         the memory layout has drifted — a device reboot restores the aligned framebuffer",
-        best.0
+        "no anonymous writable mapping large enough for a frame found after /dev/fb0 — \
+         the memory layout may have drifted; a fresh device reboot restores it"
     )
 }
 
