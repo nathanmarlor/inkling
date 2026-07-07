@@ -19,7 +19,6 @@ use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::device::capture as cap;
-use crate::device::touch;
 use crate::device::uinput::{Tool, VirtualPen};
 use crate::imagegen::OpenRouterClient;
 
@@ -625,16 +624,17 @@ const SELDELETE_TRIGGER: &str = "/tmp/inkling_seldelete";
 // extension also accepts "sel", unused here.
 const TOOL_TRIGGER: &str = "/tmp/inkling_tool";
 
-/// Y of the pen (ballpoint) icon in the left toolbar; the first tool below the
-/// undo/settings dot.
-const PEN_TOOL_XY: (u32, u32) = (55, 170);
-
-/// Select the pen tool via a real toolbar tap. This both switches the drawing tool
-/// AND clears any active selection AND moves the toolbar highlight — the native
-/// penHandler property write does none of those reliably. Used to leave the user on
-/// the pen at the end of a convert, and to deselect before injecting ink.
+/// Switch to the pen NATIVELY: the extension sets the penHandler to pen mode (so
+/// injected/drawn strokes are ink, not lasso gestures), clears any active selection
+/// (clearSelectedItems), and moves the toolbar HIGHLIGHT back to the tool the user had
+/// (restoring the selectedButton QVariant it cached while they were drawing). Unlike a
+/// coordinate toolbar tap this works regardless of the toolbar being collapsed/moved.
+/// Used to leave the user on the pen at the end of a convert, and to deselect before
+/// injecting a Q&A answer.
 fn select_pen_tool() {
-    touch::tap(PEN_TOOL_XY.0, PEN_TOOL_XY.1).ok();
+    let _ = std::fs::write(TOOL_TRIGGER, b"pen");
+    // Let the extension consume the trigger and the queued switch+deselect run.
+    std::thread::sleep(Duration::from_millis(450));
 }
 
 /// White-out the selection UI's chrome captured inside the crop: the rectangle's

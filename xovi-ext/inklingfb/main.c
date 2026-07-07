@@ -84,6 +84,7 @@ typedef void  (*qurl_dtor_fn)(void*);
 typedef char  (*setprop_fn)(void*, const char*, const void*);          // QObject::setProperty(name, QVariant)
 typedef void  (*qvar_i_fn)(void*, int);                                // QVariant(int)
 typedef void  (*qvar_d_fn)(void*, double);                             // QVariant(double)
+typedef void  (*qvar_copy_fn)(void*, const void*);                     // QVariant(const QVariant&)
 typedef void  (*setparentitem_fn)(void*, void*);                       // QQuickItem::setParentItem
 typedef void  (*setparent_fn)(void*, void*);                           // QObject::setParent
 typedef int         (*enumcount_fn)(const void*);                      // QMetaObject::enumeratorCount()
@@ -132,6 +133,7 @@ static qba_ctor_fn     p_qba_ctor;
 static qurl_ctor_fn    p_qurl_ctor;
 static qurl_dtor_fn    p_qurl_dtor;
 static setprop_fn      p_setprop;
+static qvar_copy_fn    p_qvar_copy;
 static qvar_i_fn       p_qvar_i;
 static qvar_d_fn       p_qvar_d;
 static setparentitem_fn p_setparentitem;
@@ -532,6 +534,7 @@ static const char *CONVERT_QML =
 
 static void set_prop_double(void *o, const char *n, double v);   // defined with the tool switch below
 static void set_prop_int(void *o, const char *n, int v);
+static void cache_current_tool(void *dv);
 static void gui_add_convert_button(void){   // GUI THREAD ONLY (called from gui_process)
     locate();
     void *menu = 0;
@@ -539,7 +542,13 @@ static void gui_add_convert_button(void){   // GUI THREAD ONLY (called from gui_
         const char *c = cls(g_selitems[i]);
         if(c && strstr(c,"SelectionContextualMenu")){ menu = g_selitems[i]; break; }
     }
-    if(!menu) return;                                     // no menu yet (no doc open / not created)
+    if(!menu){
+        // No selection menu = the user is drawing. Cache their current tool so we can
+        // restore the toolbar highlight after a convert switches to the pen.
+        for(int i=0;i<g_nviews;i++){ const char *vc = cls(g_views[i]);
+            if(vc && strstr(vc,"DocumentView")){ cache_current_tool(g_views[i]); break; } }
+        return;                                          // no menu yet (no doc open / not created)
+    }
     // NEVER give the menu itself a child: it is a Qt Quick Container, and a Container
     // HOOVERS any added visual child into its content model (that's how the button
     // kept landing inside the ButtonRow — appended to the row, stretching the menu —
@@ -611,6 +620,24 @@ static void gui_add_convert_button(void){   // GUI THREAD ONLY (called from gui_
 // not touched; the daemon switches to pen only while it injects, then restores.
 // Trigger: echo pen|sel > /tmp/inkling_tool
 static volatile int g_tool_req;   // 1 = pen, 2 = selection
+
+// The user's drawing tool (DocumentView.selectedButton, a QString) is cached as a
+// whole QVariant while they're drawing, then restored when we switch back to the pen
+// — this moves the toolbar HIGHLIGHT natively (the penHandler write only changes
+// behaviour). Caching the QVariant by copy-ctor avoids hand-marshalling a QString,
+// and restoring it puts back whatever tool they had (pen, marker, ...), not just pen.
+static char g_saved_tool[64] __attribute__((aligned(8)));
+static int  g_saved_tool_valid;
+static void cache_current_tool(void *dv){
+    if(!p_qvar_copy || !p_v_dtor) return;
+    char cur[64]; for(int k=0;k<64;k++) cur[k]=0;
+    p_qproperty(cur, dv, "selectedButton");          // QVariant(QString)
+    if(g_saved_tool_valid) p_v_dtor(g_saved_tool);   // release the previous cache
+    p_qvar_copy(g_saved_tool, cur);                  // holds a ref to the string data
+    g_saved_tool_valid = 1;
+    p_v_dtor(cur);
+}
+
 static void set_prop_int(void *o, const char *n, int v){
     char var[64]; for(int k=0;k<64;k++) var[k]=0; p_qvar_i(var, v);
     p_setprop(o, n, var); if(p_v_dtor) p_v_dtor(var);
@@ -621,18 +648,30 @@ static void set_prop_double(void *o, const char *n, double v){
 }
 static void gui_set_tool(void){   // GUI THREAD ONLY (called from gui_process)
     locate();
-    void *ph = 0;
-    for(int i=0;i<g_nviews && !ph;i++){
+    void *dv = 0;
+    for(int i=0;i<g_nviews && !dv;i++){
         const char *vc = cls(g_views[i]);
-        if(vc && strstr(vc,"DocumentView")) ph = read_obj_prop(g_views[i], "penHandler");
+        if(vc && strstr(vc,"DocumentView")) dv = g_views[i];
     }
+    if(!dv){ fprintf(stderr, "[inklingfb] tool switch: no DocumentView\n"); return; }
+    int pen = (g_tool_req == 1);
+    void *ph = read_obj_prop(dv, "penHandler");
     if(ph && p_setprop && p_qvar_i && p_qvar_d){
-        int pen = (g_tool_req == 1);
         set_prop_int   (ph, "lineTool",      pen ? 15 : 11);
         set_prop_int   (ph, "gestureMode",   pen ? 1  : 6);
         set_prop_double(ph, "lineThickness", pen ? 1.0 : 2.0);
-        fprintf(stderr, "[inklingfb] tool -> %s (native penHandler write)\n", pen ? "pen" : "selection");
-    } else fprintf(stderr, "[inklingfb] tool switch: no penHandler\n");
+    }
+    if(pen){
+        // Native DESELECT (deselect, not delete): clears the active selection so the
+        // user isn't left mid-selection. Replaces the coordinate toolbar-tap, so it
+        // works regardless of whether the toolbar is expanded/collapsed/moved.
+        void *sc = read_obj_prop(dv, "sceneController");
+        if(sc){ GA z = {0,0}; p_invoke(sc, "clearSelectedItems", 2, z,z,z,z,z,z,z,z,z,z,z); }
+        // Move the toolbar HIGHLIGHT back to the user's drawing tool by restoring the
+        // cached selectedButton QVariant (captured while they were drawing).
+        if(g_saved_tool_valid && p_setprop) p_setprop(dv, "selectedButton", g_saved_tool);
+    }
+    fprintf(stderr, "[inklingfb] tool -> %s (native)\n", pen ? "pen" : "selection");
 }
 
 // Capture the live screen via QQuickWindow::grabWindow() — renders the scene to a
@@ -763,6 +802,7 @@ void _xovi_construct(void){
     p_qurl_ctor   = (qurl_ctor_fn)   dlsym(RTLD_DEFAULT,"_ZN4QUrlC1Ev");
     p_qurl_dtor   = (qurl_dtor_fn)   dlsym(RTLD_DEFAULT,"_ZN4QUrlD1Ev");
     p_setprop     = (setprop_fn)     dlsym(RTLD_DEFAULT,"_ZN7QObject11setPropertyEPKcRK8QVariant");
+    p_qvar_copy   = (qvar_copy_fn)   dlsym(RTLD_DEFAULT,"_ZN8QVariantC1ERKS_");
     p_qvar_i      = (qvar_i_fn)      dlsym(RTLD_DEFAULT,"_ZN8QVariantC1Ei");
     p_qvar_d      = (qvar_d_fn)      dlsym(RTLD_DEFAULT,"_ZN8QVariantC1Ed");
     p_setparentitem=(setparentitem_fn)dlsym(RTLD_DEFAULT,"_ZN10QQuickItem13setParentItemEPS_");
