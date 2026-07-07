@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::device::capture as cap;
 use crate::device::uinput::{Tool, VirtualPen};
-use crate::imagegen::OpenRouterClient;
+use crate::imagegen::ImageGenClient;
 
 const PEN_NODE: &str = "/dev/input/event1";
 
@@ -57,6 +57,7 @@ pub enum Orientation {
 }
 
 pub struct DaemonConfig {
+    pub provider: crate::imagegen::Provider,
     pub api_key: String,
     pub model: Option<String>,
     pub dwell_s: f64,
@@ -75,6 +76,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            provider: crate::imagegen::Provider::OpenRouter,
             api_key: String::new(),
             model: None,
             dwell_s: 8.0,
@@ -480,7 +482,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     anyhow::ensure!(locked, "another inkling daemon is already running (/tmp/inkling.lock is held) — refusing to start a second");
     std::mem::forget(lock); // keep the fd (and the lock) for the process lifetime
     let calibration = crate::on_device::load_calibration(&config.calibration_path)?;
-    let client = OpenRouterClient::new(config.api_key.clone(), config.model.clone());
+    let client = ImageGenClient::new(config.provider, config.api_key.clone(), config.model.clone());
     std::fs::create_dir_all(&config.archive_dir).ok();
 
     if config.trigger_mode == TriggerMode::Selection {
@@ -497,7 +499,7 @@ pub fn run(config: DaemonConfig) -> Result<()> {
 
     // Baseline for the new-ink gate: whatever is on screen at startup.
     let mut baseline = cap::capture_now()?;
-    log::info!("inkling daemon started (dwell {}s, model {})", config.dwell_s, config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL));
+    log::info!("inkling daemon started (dwell {}s, model {})", config.dwell_s, config.model.as_deref().unwrap_or(crate::imagegen::default_model(config.provider)));
 
     let mut buf = [0u8; 16];
     loop {
@@ -938,7 +940,7 @@ fn spinlayer(cmd: &[u8]) -> bool {
 /// One selection→illustration conversion: grab the screen, find the selection's
 /// panel-space bounds, clean the crop, generate, delete the strokes natively, draw
 /// fitted.
-fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
+fn convert_selection(config: &DaemonConfig, client: &ImageGenClient, calibration: &AffineTransform) -> Result<()> {
     let frame = cap::capture_now()?;
     if looks_like_garbage(&frame) {
         anyhow::bail!("capture looks like noise — aborting convert");
@@ -1125,10 +1127,10 @@ fn spawn_convert_listener() {
 
 /// Selection-driven loop: wait for the Convert menu button (or a manual touch of the
 /// trigger file) to request a convert.
-fn run_selection_mode(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
+fn run_selection_mode(config: &DaemonConfig, client: &ImageGenClient, calibration: &AffineTransform) -> Result<()> {
     log::info!(
         "inkling daemon started (SELECTION mode, model {})",
-        config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL)
+        config.model.as_deref().unwrap_or(crate::imagegen::default_model(config.provider))
     );
     spawn_convert_listener();
     let _ = std::fs::remove_file(CONVERT_GO); // ignore a stale request from a prior run
@@ -1213,7 +1215,7 @@ fn wait_with_hourglass(
 /// on the page (which would re-trigger the loop) and never loses their drawing.
 fn run_cycle(
     config: &DaemonConfig,
-    client: &OpenRouterClient,
+    client: &ImageGenClient,
     calibration: &AffineTransform,
     baseline: &image::GrayImage,
 ) -> Result<Outcome> {
