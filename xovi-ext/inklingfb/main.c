@@ -42,6 +42,11 @@ typedef int         (*methodcount_fn)(const void*);                   // QMetaOb
 typedef void        (*method_fn)(void*, const void*, int);            // QMetaObject::method(i) -> sret QMetaMethod
 typedef void        (*methodsig_fn)(void*, const void*);              // QMetaMethod::methodSignature() -> sret QByteArray
 typedef const char *(*bconstdata_fn)(const void*);                    // QByteArray::constData()
+typedef void          (*grabwindow_fn)(void*, void*);                 // QQuickWindow::grabWindow() -> sret QImage
+typedef const unsigned char *(*qimg_bits_fn)(const void*);            // QImage::constBits()
+typedef int           (*qimg_int_fn)(const void*);                    // QImage::width/height/bytesPerLine/format
+typedef long          (*qimg_size_fn)(const void*);                   // QImage::sizeInBytes()
+typedef void          (*qimg_dtor_fn)(void*);                         // ~QImage()
 
 static invoke_fn       p_invoke;
 static classname_fn    p_className;
@@ -59,6 +64,11 @@ static methodcount_fn  p_methodcount;
 static method_fn       p_method;
 static methodsig_fn    p_methodsig;
 static bconstdata_fn   p_bconstdata;
+static grabwindow_fn   p_grabwindow;
+static qimg_bits_fn    p_qimg_bits;
+static qimg_int_fn     p_qimg_w, p_qimg_h, p_qimg_bpl, p_qimg_fmt;
+static qimg_size_fn    p_qimg_size;
+static qimg_dtor_fn    p_qimg_dtor;
 static void           *g_qobj_smo;    // &QObject::staticMetaObject
 
 // --- tiny Qt introspection helpers (all read-only, safe on any QObject) ---
@@ -71,6 +81,11 @@ static void* read_obj_prop(void *o, const char *name){
 static int is_quickitem(void *o){
     void *mo=meta_of(o);
     for(int i=0; mo && i<40; i++){ const char*c=p_className(mo); if(c&&!strcmp(c,"QQuickItem")) return 1; mo=*(void**)mo; }
+    return 0;
+}
+static int is_class(void *o, const char *want){
+    void *mo=meta_of(o);
+    for(int i=0; mo && i<40; i++){ const char*c=p_className(mo); if(c&&!strcmp(c,want)) return 1; mo=*(void**)mo; }
     return 0;
 }
 
@@ -190,11 +205,39 @@ static void delete_selection(void){
     fprintf(stderr, "[inklingfb] deleted selection (%d controller(s))\n", g_nscs);
 }
 
+// Capture the live screen via QQuickWindow::grabWindow() — renders the scene to a
+// QImage on demand (no /proc/pid/mem, no address drift). Writes a 20-byte header
+// (w, h, bytesPerLine, format, nbytes as int32) + raw pixels to /tmp/inkling_frame.
+static void grab_screen(void){
+    if(!p_grabwindow || !p_qimg_bits){ fprintf(stderr,"[inklingfb] grab: missing symbols\n"); return; }
+    void *wl[3]={0,0,0}; p_allwindows(&wl);
+    void **wins=(void**)wl[1]; long wn=(long)wl[2];
+    void *win=0;
+    for(long w=0; w<wn; w++){ if(is_class(wins[w],"QQuickWindow")){ win=wins[w]; break; } }
+    if(!win){ fprintf(stderr,"[inklingfb] grab: no QQuickWindow\n"); return; }
+    char qi[64]; for(int k=0;k<64;k++) qi[k]=0;
+    p_grabwindow(qi, win);                         // sret QImage (a fresh snapshot copy)
+    const unsigned char *bits = p_qimg_bits(qi);
+    int w=p_qimg_w(qi), h=p_qimg_h(qi), bpl=p_qimg_bpl(qi), fmt=p_qimg_fmt(qi);
+    long nb=p_qimg_size(qi);
+    if(bits && w>0 && h>0 && nb>0){
+        FILE *fp=fopen("/tmp/inkling_frame.tmp","wb");
+        if(fp){
+            int hdr[5]={w,h,bpl,fmt,(int)nb};
+            fwrite(hdr,4,5,fp); fwrite(bits,1,(size_t)nb,fp); fclose(fp);
+            rename("/tmp/inkling_frame.tmp","/tmp/inkling_frame");
+            fprintf(stderr,"[inklingfb] grabbed %dx%d bpl=%d fmt=%d (%ld bytes)\n",w,h,bpl,fmt,nb);
+        }
+    } else fprintf(stderr,"[inklingfb] grab: bad image %dx%d nb=%ld\n",w,h,nb);
+    if(p_qimg_dtor) p_qimg_dtor(qi);               // free the grabbed copy
+}
+
 static void* watcher(void* _){
     (void)_;
     for(;;){
         if(access("/tmp/inklingfb_clear",  F_OK)==0){ clear_page();       unlink("/tmp/inklingfb_clear"); }
         if(access("/tmp/inklingfb_delsel", F_OK)==0){ delete_selection(); unlink("/tmp/inklingfb_delsel"); }
+        if(access("/tmp/inkling_grab",     F_OK)==0){ grab_screen();      unlink("/tmp/inkling_grab"); }
         if(access("/tmp/inkling_probe",    F_OK)==0){ probe_selection();  unlink("/tmp/inkling_probe"); }
         usleep(120000);
     }
@@ -218,8 +261,16 @@ void _xovi_construct(void){
     p_method      = (method_fn)      dlsym(RTLD_DEFAULT,"_ZNK11QMetaObject6methodEi");
     p_methodsig   = (methodsig_fn)   dlsym(RTLD_DEFAULT,"_ZNK11QMetaMethod15methodSignatureEv");
     p_bconstdata  = (bconstdata_fn)  dlsym(RTLD_DEFAULT,"_ZNK10QByteArray9constDataEv");
+    p_grabwindow  = (grabwindow_fn)  dlsym(RTLD_DEFAULT,"_ZN12QQuickWindow10grabWindowEv");
+    p_qimg_bits   = (qimg_bits_fn)   dlsym(RTLD_DEFAULT,"_ZNK6QImage9constBitsEv");
+    p_qimg_w      = (qimg_int_fn)    dlsym(RTLD_DEFAULT,"_ZNK6QImage5widthEv");
+    p_qimg_h      = (qimg_int_fn)    dlsym(RTLD_DEFAULT,"_ZNK6QImage6heightEv");
+    p_qimg_bpl    = (qimg_int_fn)    dlsym(RTLD_DEFAULT,"_ZNK6QImage12bytesPerLineEv");
+    p_qimg_fmt    = (qimg_int_fn)    dlsym(RTLD_DEFAULT,"_ZNK6QImage6formatEv");
+    p_qimg_size   = (qimg_size_fn)   dlsym(RTLD_DEFAULT,"_ZNK6QImage11sizeInBytesEv");
+    p_qimg_dtor   = (qimg_dtor_fn)   dlsym(RTLD_DEFAULT,"_ZN6QImageD1Ev");
     g_qobj_smo    = dlsym(RTLD_DEFAULT,"_ZN7QObject16staticMetaObjectE");
-    unlink("/tmp/inklingfb_clear"); unlink("/tmp/inklingfb_delsel"); unlink("/tmp/inkling_probe");  // never act on a stale trigger during startup
+    unlink("/tmp/inklingfb_clear"); unlink("/tmp/inklingfb_delsel"); unlink("/tmp/inkling_probe"); unlink("/tmp/inkling_grab");  // never act on a stale trigger during startup
     fprintf(stderr, "[inklingfb] loaded (clear + selection probe)\n");
     pthread_t t; pthread_create(&t, NULL, watcher, NULL);
 }

@@ -8,16 +8,58 @@ use anyhow::{bail, Context, Result};
 use image::{GrayImage, Luma};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 pub const WIDTH: u32 = 1404;
 pub const HEIGHT: u32 = 1872;
 const STRIDE: u64 = WIDTH as u64 * 4;
 const FRAME_BYTES: usize = (WIDTH as u64 * HEIGHT as u64 * 4) as usize;
 
-// NOTE: an in-xochitl capture path (inklingfb extension hooking the QImage ctor to
-// hand us its live panel buffer) was tried and reverted — hooking that hot, threaded
-// ctor destabilises xochitl's renderer (see xovi-ext/inklingfb/main.c). Capture stays
-// here, reading the framebuffer out of xochitl's /proc/pid/mem.
+// Primary capture: ask the inklingfb extension to grab the window via
+// QQuickWindow::grabWindow() (renders the scene to a QImage on demand). This is
+// immune to the /proc/pid/mem address drift that plagues the fallback below —
+// see xovi-ext/inklingfb/main.c (grab_screen). Contract:
+//   touch /tmp/inkling_grab -> extension writes /tmp/inkling_frame:
+//     20-byte header: w, h, bytesPerLine, format, nbytes (int32 LE), then raw pixels.
+const GRAB_TRIGGER: &str = "/tmp/inkling_grab";
+const GRAB_FRAME: &str = "/tmp/inkling_frame";
+
+fn capture_via_grab() -> Result<GrayImage> {
+    let _ = fs::remove_file(GRAB_FRAME);
+    fs::write(GRAB_TRIGGER, []).context("writing grab trigger")?;
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while !Path::new(GRAB_FRAME).exists() {
+        if Instant::now() >= deadline {
+            let _ = fs::remove_file(GRAB_TRIGGER);
+            bail!("inklingfb grab produced no frame within 1.5s (extension loaded?)");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let buf = fs::read(GRAB_FRAME).context("reading grab frame")?;
+    let _ = fs::remove_file(GRAB_FRAME);
+    if buf.len() < 20 {
+        bail!("grab frame too short ({} bytes)", buf.len());
+    }
+    let rd = |i: usize| i32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+    let (w, h, bpl) = (rd(0), rd(4), rd(8));
+    if w != WIDTH as usize || h != HEIGHT as usize {
+        bail!("grab returned unexpected dimensions {w}x{h}");
+    }
+    let px = &buf[20..];
+    if px.len() < h * bpl {
+        bail!("grab frame pixel data too short");
+    }
+    // 32-bit RGB32/ARGB32 (little-endian B,G,R,A) — content is grayscale, take green.
+    let mut img = GrayImage::new(WIDTH, HEIGHT);
+    for y in 0..h {
+        let ro = y * bpl;
+        for x in 0..w {
+            img.put_pixel(x as u32, y as u32, Luma([px[ro + x * 4 + 1]]));
+        }
+    }
+    Ok(img)
+}
 
 fn firmware_bytes_per_pixel_and_offset() -> Result<(u64, u64)> {
     let os_release = fs::read_to_string("/etc/os-release").context("reading /etc/os-release")?;
@@ -113,7 +155,14 @@ pub fn capture_frame(pid: i32, addr: u64) -> Result<GrayImage> {
 }
 
 pub fn capture_now() -> Result<GrayImage> {
-    let pid = find_xochitl_pid()?;
-    let addr = find_capture_address(pid)?;
-    capture_frame(pid, addr)
+    // Prefer the xovi grabWindow path (drift-immune); fall back to /proc/pid/mem.
+    match capture_via_grab() {
+        Ok(img) => Ok(img),
+        Err(e) => {
+            log::warn!("grab capture unavailable ({e}); falling back to /proc/pid/mem");
+            let pid = find_xochitl_pid()?;
+            let addr = find_capture_address(pid)?;
+            capture_frame(pid, addr)
+        }
+    }
 }
