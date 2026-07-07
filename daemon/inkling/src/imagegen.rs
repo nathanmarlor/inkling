@@ -9,6 +9,23 @@ use std::io::Read;
 
 pub const DEFAULT_MODEL: &str = "google/gemini-2.5-flash-image";
 
+/// Vision+text model used to read a handwritten selection and either answer it (if
+/// it's a question/request) or report that it's a drawing. Kept separate from the
+/// image model above, which only does image-out.
+pub const QA_MODEL: &str = "google/gemini-2.5-flash";
+
+/// Sentinel the QA model returns when the selection is a drawing, not writing.
+const SKETCH_SENTINEL: &str = "SKETCH";
+
+/// Prompt for the read-and-answer step. Deliberately strict about the sentinel so
+/// the daemon can branch reliably.
+const QA_PROMPT: &str = "This image is a handwritten note or drawing from a child's paper tablet. \
+If it contains handwriting, read it and give a direct, helpful ANSWER to the question or request it \
+makes. Do NOT repeat or transcribe the handwriting back — answer it. Reply with only the answer, in \
+one to three short, simple sentences a young child could read, no preamble and no markdown. If the \
+image is a drawing or sketch rather than handwriting, reply with exactly the single word SKETCH and \
+nothing else.";
+
 /// Rough scribble -> impressive image. Turn the sketch into a polished, detailed
 /// professional line illustration with a fitting background — clean confident
 /// inking, NOT a messy scribble — while staying faithful to the subject and its
@@ -62,6 +79,38 @@ impl OpenRouterClient {
             .read_to_string(&mut text)
             .context("reading openrouter response")?;
         serde_json::from_str(&text).context("parsing openrouter response")
+    }
+
+    /// Read the selection. Returns `Some(answer)` if it's a handwritten question,
+    /// `None` if it's a drawing (caller should run the illustration flow instead).
+    pub fn answer_if_question(&self, sketch_png: &[u8]) -> Result<Option<String>> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sketch_png);
+        let body = serde_json::json!({
+            "model": QA_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}},
+                    {"type": "text", "text": QA_PROMPT},
+                ],
+            }],
+        });
+        let v = self.post(&body)?;
+        if let Some(cost) = v.pointer("/usage/cost").and_then(|c| c.as_f64()) {
+            log::info!("openrouter Q&A cost: ${cost:.4}");
+        }
+        let text = v
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .context("no content in Q&A response")?
+            .trim();
+        // Treat an exact/leading SKETCH as "this is a drawing".
+        if text.eq_ignore_ascii_case(SKETCH_SENTINEL)
+            || text.to_ascii_uppercase().starts_with(SKETCH_SENTINEL)
+        {
+            return Ok(None);
+        }
+        Ok(Some(text.to_string()))
     }
 
     /// Straight redraw from the sketch (no classification step).

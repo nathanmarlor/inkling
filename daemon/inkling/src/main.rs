@@ -350,6 +350,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
                     other => anyhow::bail!("unknown [mode] trigger = {other:?} (want \"inactivity\" or \"selection\")"),
                 };
             }
+            if let Some(f) = gets("answer", "font") { cfg.answer_font = f; }
             if let Some(o) = gets("mode", "orientation") {
                 cfg.orientation = match o.to_ascii_lowercase().as_str() {
                     "auto" => daemon::Orientation::Auto,

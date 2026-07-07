@@ -375,7 +375,7 @@ static void selection_info(void){
     locate();
     FILE *fp = fopen("/tmp/inkling_selinfo_out.tmp","w");
     if(!fp) return;
-    int count = 0; CRectF vr = {0,0,0,0};
+    int count = 0; CRectF vr = {0,0,0,0}; void *active_sc = 0;
     for(int i=0;i<g_nselitems && p_v_toint && p_v_torectf;i++){
         const char *c = cls(g_selitems[i]);
         if(!c || !strstr(c,"SceneSelectionHandler")) continue;
@@ -388,21 +388,25 @@ static void selection_info(void){
             CRectF sr = p_v_torectf(v3); if(p_v_dtor) p_v_dtor(v3);
             if(vr.w > 0.0 && sr.w > 0.0){ g_scene_dx = sr.x - vr.x; g_scene_dy = sr.y - vr.y; }
         }
-        void *sc = read_obj_prop(g_selitems[i], "controller");
-        if(sc){ char v2[64]; for(int k=0;k<64;k++) v2[k]=0; p_qproperty(v2, sc, "selectionItemCount"); count = p_v_toint(v2,0); if(p_v_dtor) p_v_dtor(v2); }
+        active_sc = read_obj_prop(g_selitems[i], "controller");
+        if(active_sc){ char v2[64]; for(int k=0;k<64;k++) v2[k]=0; p_qproperty(v2, active_sc, "selectionItemCount"); count = p_v_toint(v2,0); if(p_v_dtor) p_v_dtor(v2); }
         break;
     }
-    // The document's Landscape/Portrait setting (DocumentView.portrait) — tells the
-    // daemon which way the artist holds the tablet, so the model sees the sketch
-    // upright. 1 = portrait, 0 = landscape.
-    int portrait = 0;
+    // DocumentView.portrait — how the tablet is held, so the daemon uprights the
+    // sketch for the model. xochitl POOLS DocumentViews, so read it from the one that
+    // owns the ACTIVE selection's controller (matching the first DocumentView blindly
+    // returned a stale pooled value → the orientation flip-flopped run to run).
+    int portrait = 1;   // default portrait (the native reMarkable orientation)
+    void *doc_view = 0;
     for(int i=0;i<g_nviews;i++){
         const char *vc = cls(g_views[i]);
-        if(vc && strstr(vc,"DocumentView")){
-            char v[64]; for(int k=0;k<64;k++) v[k]=0; p_qproperty(v, g_views[i], "portrait");
-            portrait = p_v_tobool ? (int)p_v_tobool(v) : 0; if(p_v_dtor) p_v_dtor(v);
-            break;
-        }
+        if(!vc || !strstr(vc,"DocumentView")) continue;
+        if(active_sc && read_obj_prop(g_views[i],"sceneController") == active_sc){ doc_view = g_views[i]; break; }
+        if(!doc_view) doc_view = g_views[i];   // fallback to first if no match
+    }
+    if(doc_view){
+        char v[64]; for(int k=0;k<64;k++) v[k]=0; p_qproperty(v, doc_view, "portrait");
+        portrait = p_v_tobool ? (int)p_v_tobool(v) : 1; if(p_v_dtor) p_v_dtor(v);
     }
     fprintf(fp, "%d %.1f %.1f %.1f %.1f %d\n", count, vr.x, vr.y, vr.w, vr.h, portrait);
     fclose(fp);

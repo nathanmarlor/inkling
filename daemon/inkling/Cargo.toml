@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 inkling-core = { path = "../inkling-core" }
 image = { version = "0.25", default-features = false, features = ["png"] }
+ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

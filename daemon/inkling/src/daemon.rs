@@ -71,6 +71,8 @@ pub struct DaemonConfig {
     pub pause_file: String,
     pub trigger_mode: TriggerMode,
     pub orientation: Orientation,
+    /// TTF used to render handwritten-question answers back onto the page.
+    pub answer_font: String,
 }
 
 impl Default for DaemonConfig {
@@ -94,6 +96,8 @@ impl Default for DaemonConfig {
             // Portrait is the only coordinate-correct selection orientation (see the
             // Orientation note). `landscape`/`auto` are opt-in via [mode] orientation.
             orientation: Orientation::Portrait,
+            // reMarkable ships Noto Sans; readable and already on the device.
+            answer_font: "/usr/share/fonts/ttf/noto/NotoSans-Regular.ttf".into(),
         }
     }
 }
@@ -649,10 +653,21 @@ fn mask_selection_ui(crop: &mut image::GrayImage) {
     fill(w.saturating_sub(ROT_W) / 2, 0, ROT_W, ROT_H); // rotate handle, top-centre
 }
 
-/// Ask the extension for the live selection's native bounds (view px), stroke
-/// count, and the document's portrait flag. Returns None if there's no live
+/// The live selection as the extension reports it.
+struct SelectionInfo {
+    /// number of selected strokes (0 = nothing selected)
+    count: u32,
+    /// document orientation flag (DocumentView.portrait)
+    portrait: bool,
+    /// selection bbox in xochitl VIEW coords — correct in portrait, but rotated when
+    /// the tablet is held landscape, so it is only a fallback for the capture-derived
+    /// (panel-space) bounds below.
+    view_bounds: (u32, u32, u32, u32),
+}
+
+/// Ask the extension for the live selection info. Returns None if there's no live
 /// selection (count 0) or no reply.
-fn native_selection_bounds() -> Option<(u32, u32, u32, u32, bool)> {
+fn native_selection_info() -> Option<SelectionInfo> {
     let _ = std::fs::remove_file(SELINFO_OUT);
     std::fs::write(SELINFO_TRIGGER, []).ok()?;
     for _ in 0..20 {
@@ -665,16 +680,178 @@ fn native_selection_bounds() -> Option<(u32, u32, u32, u32, bool)> {
             let w = (v[3] as u32).min(cap::WIDTH.saturating_sub(x));
             let h = (v[4] as u32).min(cap::HEIGHT.saturating_sub(y));
             let portrait = v.get(5).copied().unwrap_or(0.0) >= 0.5;
-            log::info!("native selection: {} item(s), view rect [{x} {y} {w} {h}], portrait={portrait}", v[0]);
-            return Some((x, y, w, h, portrait));
+            return Some(SelectionInfo { count: v[0] as u32, portrait, view_bounds: (x, y, w, h) });
         }
         return None; // replied, but no live selection
     }
     None
 }
 
-/// Draw an illustration fitted into a selection bounding box (portrait page px).
-/// `landscape` matches the orientation the sketch PNG was prepared in.
+/// Locate the selection's bounding box in the CAPTURE (panel px) from its grey
+/// overlay fill. Because it reads the actual captured pixels, it is correct in both
+/// orientations — unlike the view-space native bounds, which rotate in landscape.
+/// xochitl fills the selection with a solid mid-grey (~194); find that grey's dense
+/// row/column band (stray grey is sparse; the fill is a solid rectangle).
+fn detect_selection_bounds(img: &image::GrayImage) -> Option<(u32, u32, u32, u32)> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let raw = img.as_raw();
+    let mut hist = [0u32; 256];
+    for &p in raw {
+        if (150..=225).contains(&p) {
+            hist[p as usize] += 1;
+        }
+    }
+    let (grey, cnt) = hist.iter().enumerate().max_by_key(|(_, &c)| c).map(|(i, &c)| (i as i32, c))?;
+    if cnt < 5000 {
+        return None; // no sizeable grey block => no detectable selection fill
+    }
+    let is_sel = |v: u8| (v as i32 - grey).abs() <= 6;
+    let mut rows = vec![0u32; h];
+    let mut cols = vec![0u32; w];
+    for y in 0..h {
+        let ro = y * w;
+        for x in 0..w {
+            if is_sel(raw[ro + x]) {
+                rows[y] += 1;
+                cols[x] += 1;
+            }
+        }
+    }
+    // Contiguous band where the projection exceeds half its peak = the filled rectangle.
+    let band = |arr: &[u32]| -> Option<(usize, usize)> {
+        let m = *arr.iter().max()?;
+        if m == 0 {
+            return None;
+        }
+        let thr = m / 2;
+        Some((arr.iter().position(|&v| v > thr)?, arr.iter().rposition(|&v| v > thr)?))
+    };
+    let (y0, y1) = band(&rows)?;
+    let (x0, x1) = band(&cols)?;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
+/// Handwritten-question path: render the answer and ink it just below the question,
+/// leaving the question itself in place. Portrait-oriented (the answer is drawn
+/// upright in panel space); the question stays selected-then-deselected as we switch
+/// to the pen. `sel` is the question's panel-px bbox (bx, by, bw, bh).
+fn answer_question(
+    answer: &str,
+    sel: (u32, u32, u32, u32),
+    _landscape: bool,
+    calibration: &AffineTransform,
+    config: &DaemonConfig,
+    ts: u64,
+) -> Result<()> {
+    let (bx, by, bw, bh) = sel;
+    let width = bw.max(240).min(cap::WIDTH.saturating_sub(bx)).max(1);
+    let (png, text_h) = render_text_png(answer, width, &config.answer_font)?;
+    std::fs::write(format!("{}/{ts}-answer.png", config.archive_dir), &png).ok();
+
+    // Region directly below the question, clamped to the page.
+    let gap = 24;
+    let ry = (by + bh + gap).min(cap::HEIGHT - 1);
+    let rh = text_h.min(cap::HEIGHT.saturating_sub(ry)).max(1);
+    let region = (bx, ry, width, rh);
+
+    // Deselect the question WITHOUT deleting it, then draw. A real toolbar tap on the
+    // pen tool both switches tool and clears the active selection — the native
+    // property tool-switch does NOT deselect, so injecting the answer while the
+    // question was still selected dragged/cut it (the question vanished). Tap the pen
+    // icon, give the selection time to clear, then ink the answer.
+    touch::tap(55, 170).ok();
+    std::thread::sleep(Duration::from_millis(600));
+    draw_png_bounds(&png, region, false, calibration, config)?;
+    log::info!("answer inked below the question");
+    Ok(())
+}
+
+/// Render `text` as black-on-white word-wrapped lines to a PNG `width_px` wide, using
+/// the TTF at `font_path`. Returns the PNG bytes and the rendered pixel height.
+fn render_text_png(text: &str, width_px: u32, font_path: &str) -> Result<(Vec<u8>, u32)> {
+    use ab_glyph::{point, Font, FontVec, Glyph, PxScale, ScaleFont};
+    let data = std::fs::read(font_path).with_context(|| format!("reading font {font_path}"))?;
+    let font = FontVec::try_from_vec(data).context("parsing font")?;
+    let px = 46.0_f32;
+    let scale = PxScale::from(px);
+    let sf = font.as_scaled(scale);
+    let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil();
+    let margin = 8.0_f32;
+    let max_w = (width_px as f32 - 2.0 * margin).max(1.0);
+
+    // Word-wrap: measure each word's advance and break lines that overflow.
+    let advance = |s: &str| -> f32 {
+        let mut w = 0.0;
+        let mut prev: Option<char> = None;
+        for c in s.chars() {
+            if let Some(p) = prev { w += sf.kern(font.glyph_id(p), font.glyph_id(c)); }
+            w += sf.h_advance(font.glyph_id(c));
+            prev = Some(c);
+        }
+        w
+    };
+    let space_w = advance(" ");
+    let mut lines: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        let mut line_w = 0.0;
+        for word in para.split_whitespace() {
+            let ww = advance(word);
+            if !line.is_empty() && line_w + space_w + ww > max_w {
+                lines.push(std::mem::take(&mut line));
+                line_w = 0.0;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+                line_w += space_w;
+            }
+            line.push_str(word);
+            line_w += ww;
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    let height = (line_h * lines.len() as f32 + 2.0 * margin).ceil() as u32;
+    let mut img = image::GrayImage::from_pixel(width_px, height.max(1), image::Luma([255]));
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    for (li, line) in lines.iter().enumerate() {
+        let baseline = margin + sf.ascent() + li as f32 * line_h;
+        let mut caret = margin;
+        let mut prev: Option<char> = None;
+        for c in line.chars() {
+            let id = font.glyph_id(c);
+            if let Some(p) = prev { caret += sf.kern(font.glyph_id(p), id); }
+            let g: Glyph = id.with_scale_and_position(scale, point(caret, baseline));
+            if let Some(og) = font.outline_glyph(g) {
+                let bb = og.px_bounds();
+                og.draw(|dx, dy, cov| {
+                    let x = bb.min.x as i32 + dx as i32;
+                    let y = bb.min.y as i32 + dy as i32;
+                    if x >= 0 && y >= 0 && x < iw && y < ih && cov > 0.35 {
+                        img.put_pixel(x as u32, y as u32, image::Luma([0]));
+                    }
+                });
+            }
+            caret += sf.h_advance(id);
+            prev = Some(c);
+        }
+    }
+    let mut png = Vec::new();
+    image::DynamicImage::ImageLuma8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok((png, height))
+}
+
+/// Draw an artist-upright illustration fitted into a selection bounding box (panel
+/// px). `landscape` = the tablet was held landscape, so the illustration must be
+/// rotated back into panel space (270° — the inverse of the 90° applied to upright
+/// the sketch for the model) before it is traced. Portrait draws as-is.
 fn draw_png_bounds(
     png: &[u8],
     region: (u32, u32, u32, u32),
@@ -683,8 +860,16 @@ fn draw_png_bounds(
     config: &DaemonConfig,
 ) -> Result<()> {
     let tmp = "/tmp/inkling_draw.png";
-    std::fs::write(tmp, png)?;
-    let (vec_result, _, _) = crate::vectorize_for_bounds(tmp, landscape, config.max_points, region)?;
+    if landscape {
+        // Rotate into panel space here, then trace with no further rotation — keeps
+        // vectorize's own `landscape` meaning (used by the CLI/inactivity flow) intact.
+        let img = image::load_from_memory(png).context("decoding illustration")?;
+        let rotated = image::DynamicImage::ImageRgba8(image::imageops::rotate270(&img.to_rgba8()));
+        rotated.save(tmp).context("writing rotated illustration")?;
+    } else {
+        std::fs::write(tmp, png)?;
+    }
+    let (vec_result, _, _) = crate::vectorize_for_bounds(tmp, false, config.max_points, region)?;
     log::info!("drawing {} strokes into selection...", vec_result.strokes.len());
     let mut pen = VirtualPen::open_existing(PEN_NODE)?;
     pen.tool_in(Tool::Pen)?;
@@ -719,11 +904,12 @@ fn query_layer() -> Option<(i32, i32)> {
     None
 }
 
-/// Send a spinlayer command and WAIT until the layer switch has actually landed.
-/// setCurrentLayer is applied by a deferred internal event, so a fixed sleep races
-/// it — the spinner then inked the user's own layer and survived cleanup. `begin`
-/// waits for the layer count to grow (the scratch layer exists and is current);
-/// `end` waits for it to shrink back. Returns false on timeout.
+/// Send a spinlayer command and WAIT until it has landed, watching the LAYER COUNT
+/// (not currentLayer — that property is deferred and often never reflects the switch
+/// in a readback, which made this skip the spinner entirely). The extension queues
+/// addLayer then setCurrentLayer back-to-back, so once the count change is visible the
+/// setCurrentLayer queued right after it has also run and the scratch layer is current.
+/// `begin` waits for the count to grow, `end` for it to shrink back. False on timeout.
 fn spinlayer(cmd: &[u8]) -> bool {
     let baseline = query_layer().map(|(_, n)| n).unwrap_or(1);
     let _ = std::fs::write(SPINLAYER_TRIGGER, cmd);
@@ -731,9 +917,9 @@ fn spinlayer(cmd: &[u8]) -> bool {
     let deadline = Instant::now() + Duration::from_millis(2500);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(60));
-        if let Some((cur, count)) = query_layer() {
+        if let Some((_cur, count)) = query_layer() {
             let settled = if want_grow {
-                count > baseline && cur == count - 1 // scratch layer added and current
+                count > baseline // scratch layer added (and setCurrentLayer ran right after)
             } else {
                 count < baseline // scratch layer gone
             };
@@ -747,29 +933,38 @@ fn spinlayer(cmd: &[u8]) -> bool {
     false
 }
 
-/// One selection→illustration conversion: grab the screen, read the native selection
-/// bounds, clean the crop, generate, delete the strokes natively, draw fitted.
+/// One selection→illustration conversion: grab the screen, find the selection's
+/// panel-space bounds, clean the crop, generate, delete the strokes natively, draw
+/// fitted.
 fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
     let frame = cap::capture_now()?;
     if looks_like_garbage(&frame) {
         anyhow::bail!("capture looks like noise — aborting convert");
     }
-    let (bx, by, bw, bh, doc_portrait) = native_selection_bounds()
+    let sel = native_selection_info()
         .context("no selection detected (select some strokes, then tap AI)")?;
+    // Bounds come from the captured grey overlay (PANEL px — correct in both
+    // orientations), not the native view rect (which rotates in landscape). Fall back
+    // to the view rect only if the overlay isn't detectable (portrait-correct at least).
+    let (bx, by, bw, bh) = detect_selection_bounds(&frame).unwrap_or_else(|| {
+        log::warn!("selection grey overlay not found in capture; using native view bounds");
+        sel.view_bounds
+    });
     // The model must see the sketch the way the artist drew it. The document's
     // orientation setting (xochitl's ⋯ menu → Landscape/Portrait) says how the
     // tablet is held; config [mode] orientation can pin it instead of following.
     let landscape = match config.orientation {
         Orientation::Landscape => true,
         Orientation::Portrait => false,
-        Orientation::Auto => !doc_portrait,
+        Orientation::Auto => !sel.portrait,
     };
-    log::info!("converting selection {bw}x{bh} at ({bx},{by}), {} input", if landscape { "landscape" } else { "portrait" });
+    log::info!("converting selection {bw}x{bh} at ({bx},{by}), {} item(s), {} input",
+        sel.count, if landscape { "landscape" } else { "portrait" });
 
     // History, named by timestamp. BEFORE = the whole screen, artist-oriented.
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     std::fs::create_dir_all(&config.archive_dir).ok();
-    let before = if landscape { image::imageops::rotate270(&frame) } else { frame.clone() };
+    let before = if landscape { image::imageops::rotate90(&frame) } else { frame.clone() };
     let _ = save_gray_png(&before, &format!("{}/{ts}-before.png", config.archive_dir));
 
     // Crop the selection and clean it: the grey overlay + paper go white, ink stays
@@ -795,12 +990,27 @@ fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibrati
     let ew = (bw + 2 * pad_x).min(cap::WIDTH - ex);
     let eh = (bh + 2 * pad_y).min(cap::HEIGHT - ey);
     let draw_region = (ex, ey, ew, eh);
-    let oriented = if landscape { image::imageops::rotate270(&padded) } else { padded };
+    // Upright the sketch for the model. Portrait: the panel IS the artist's view.
+    // Landscape: xochitl stores the page rotated 90° in the portrait panel, so rotate
+    // the crop 90° to the artist's upright view. (draw_png_bounds applies the inverse
+    // 270° to place the result back — the pair must round-trip.)
+    let oriented = if landscape { image::imageops::rotate90(&padded) } else { padded };
     let mut sketch_png = Vec::new();
     image::DynamicImage::ImageLuma8(oriented)
         .write_to(&mut std::io::Cursor::new(&mut sketch_png), image::ImageFormat::Png)?;
     // Archive the EXACT model input, so "what did it see?" is always answerable.
     std::fs::write(format!("{}/{ts}-sketch.png", config.archive_dir), &sketch_png).ok();
+
+    // Read the selection first: if it's a handwritten question, answer it in ink and
+    // leave the question in place; otherwise fall through to the illustration flow.
+    match client.answer_if_question(&sketch_png) {
+        Ok(Some(answer)) => {
+            log::info!("answering question: {answer}");
+            return answer_question(&answer, (bx, by, bw, bh), landscape, calibration, config, ts);
+        }
+        Ok(None) => {} // a drawing — illustrate it
+        Err(e) => log::warn!("Q&A read failed ({e:#}); treating as a drawing"),
+    }
 
     // Generate on a thread so the spinner can run during the API round-trip.
     log::info!("generating illustration...");
@@ -869,7 +1079,7 @@ fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibrati
     // AFTER = the whole screen once the illustration is on the page.
     std::thread::sleep(Duration::from_millis(500));
     if let Ok(after) = cap::capture_now() {
-        let oriented_after = if landscape { image::imageops::rotate270(&after) } else { after };
+        let oriented_after = if landscape { image::imageops::rotate90(&after) } else { after };
         let _ = save_gray_png(&oriented_after, &format!("{}/{ts}-after.png", config.archive_dir));
     }
     log::info!("selection convert complete");
