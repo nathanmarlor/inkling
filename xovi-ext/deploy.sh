@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy inklingfb (hook-free page-clear xovi extension) + the inkling daemon, then
+# Deploy the inklingfb xovi extension + the inkling daemon, then
 # self-test the page-clear trigger.
 #
 # Usage:  RM2_HOST=<tablet-ip> RM2_PASS='<root-password>' ./deploy.sh

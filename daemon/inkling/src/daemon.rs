@@ -19,6 +19,7 @@ use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::device::capture as cap;
+use crate::device::touch;
 use crate::device::uinput::{Tool, VirtualPen};
 use crate::imagegen::OpenRouterClient;
 
@@ -34,9 +35,26 @@ const BTN_TOUCH: u16 = 0x14a;
 pub enum TriggerMode {
     /// Original flow: finished-sketch detection turns the whole page after a quiet period.
     Inactivity,
-    /// New flow: the user selects strokes and taps the "Convert" selection-menu item,
+    /// New flow: the user selects strokes and taps the "AI" selection-menu button,
     /// and only that selection is turned into the illustration, fitted to its bounds.
     Selection,
+}
+
+/// Which way the artist holds the tablet — i.e. the orientation of the sketch the
+/// model should see, and which way up to draw the spinner.
+///
+/// NOTE: the selection flow is coordinate-correct only in **portrait** (the native
+/// framebuffer orientation). Held landscape, xochitl reports selection coordinates in
+/// rotated space while the capture and pen digitizer stay portrait, so selection and
+/// redraw land in the wrong place. `Landscape`/`Auto` therefore only rotate the model
+/// input + spinner; they do NOT fix that coordinate mismatch. Default is `Portrait`.
+/// `Auto` follows the document's DocumentView.portrait flag (can be unreliable when
+/// xochitl pools views — pin `portrait`/`landscape` if it flip-flops).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Orientation {
+    Auto,
+    Landscape,
+    Portrait,
 }
 
 pub struct DaemonConfig {
@@ -52,6 +70,7 @@ pub struct DaemonConfig {
     pub archive_dir: String,
     pub pause_file: String,
     pub trigger_mode: TriggerMode,
+    pub orientation: Orientation,
 }
 
 impl Default for DaemonConfig {
@@ -72,6 +91,9 @@ impl Default for DaemonConfig {
             archive_dir: "/home/root/.local/share/inkling/archive".into(),
             pause_file: "/home/root/.config/inkling/pause".into(),
             trigger_mode: TriggerMode::Inactivity,
+            // Portrait is the only coordinate-correct selection orientation (see the
+            // Orientation note). `landscape`/`auto` are opt-in via [mode] orientation.
+            orientation: Orientation::Portrait,
         }
     }
 }
@@ -345,8 +367,26 @@ fn looks_like_garbage(img: &image::GrayImage) -> bool {
     if raw.is_empty() {
         return true;
     }
-    let mid = raw.iter().filter(|&&p| (60..=205).contains(&p)).count();
-    mid * 100 / raw.len() > 15
+    // The selection overlay is a legitimate solid mid-grey fill (~194) that can cover
+    // a large area — a big selection must not read as noise. Noise is SPREAD across
+    // many grey values; a fill is one tone. Score mid-grey excluding the dominant
+    // tone (±6 to cover dithering at the fill edges).
+    let mut hist = [0usize; 256];
+    for &p in raw {
+        hist[p as usize] += 1;
+    }
+    let modal = (60..=205usize).max_by_key(|&v| hist[v]).unwrap_or(60);
+    let lo = modal.saturating_sub(6);
+    let hi = (modal + 6).min(205);
+    let mid: usize = (60..=205usize).filter(|v| !(lo..=hi).contains(v)).map(|v| hist[v]).sum();
+    if mid * 100 / raw.len() > 15 {
+        return true;
+    }
+    // A real page is mostly paper. An all-black or all-dark frame (mis-aligned /proc
+    // read, sleep screen) has no mid-grey at all and sails past the noise check —
+    // one such frame fed the model a black rectangle and it drew dense mud.
+    let near_white: usize = hist[206..].iter().sum();
+    near_white * 100 / raw.len() < 50
 }
 
 /// Clear the page via xochitl's own SceneController (the clean native clear).
@@ -373,21 +413,39 @@ fn native_clear() -> Result<()> {
     Ok(())
 }
 
-// The pen's coordinate space is rotated 90° vs the framebuffer, so this hourglass
-// is drawn "wide" (w>h) with a left/right bow-tie so it reads as an upright ⧗.
 const LOAD_CX: f32 = 702.0;
 const LOAD_CY: f32 = 936.0;
 
+/// Radius of the full spinner (ring ticks) at scale 1.0 — used both to draw it and
+/// to bound the native select-and-delete that removes it in selection mode.
+const LOAD_RADIUS: f32 = 180.0;
+
 /// Draw the hourglass outline once — a "working…" indicator so the wait for the
-/// illustration isn't a dead blank screen.
-fn draw_loading_hourglass(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64) -> Result<()> {
+/// illustration isn't a dead blank screen. `k` scales the figure (1.0 = full-page).
+///
+/// The hourglass is two straight edges joined by crossing diagonals. WHICH pair of
+/// edges is straight decides the axis, so the two orientations use different corner
+/// orders (swapping w/h alone only stretches the same bow-tie — the bug the artist
+/// saw). Held landscape the panel is rotated 90° from the artist, so the framebuffer
+/// figure is a horizontal bow-tie; held portrait it's an upright ⧗. Either way it
+/// reads upright to the artist.
+fn draw_loading_hourglass_at(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64, cx: f32, cy: f32, k: f32, landscape: bool) -> Result<()> {
     use inkling_core::geometry::Stroke;
-    let (cx, cy) = (LOAD_CX, LOAD_CY);
-    let (w, h) = (85.0_f32, 60.0_f32);
-    // TL -> BL -> TR -> BR -> TL: vertical left/right edges with crossing diagonals.
-    let corners = [
-        (cx - w, cy - h), (cx - w, cy + h), (cx + w, cy - h), (cx + w, cy + h), (cx - w, cy - h),
-    ];
+    let tl = |w: f32, h: f32| (cx - w, cy - h);
+    let tr = |w: f32, h: f32| (cx + w, cy - h);
+    let bl = |w: f32, h: f32| (cx - w, cy + h);
+    let br = |w: f32, h: f32| (cx + w, cy + h);
+    let corners = if landscape {
+        // vertical straight edges + X = bow-tie lying on its side (reads upright when
+        // the device is held landscape). TL -> BL -> TR -> BR -> TL.
+        let (w, h) = (85.0_f32 * k, 60.0_f32 * k);
+        [tl(w, h), bl(w, h), tr(w, h), br(w, h), tl(w, h)]
+    } else {
+        // horizontal straight edges (top & bottom) + X = upright hourglass ⧗.
+        // TL -> TR -> BL -> BR -> TL.
+        let (w, h) = (60.0_f32 * k, 85.0_f32 * k);
+        [tl(w, h), tr(w, h), bl(w, h), br(w, h), tl(w, h)]
+    };
     let mut s = Stroke::new();
     for (x, y) in corners { s.push(x, y, 0.85); }
     let dense = crate::on_device::densify(&s, 3.0);
@@ -398,12 +456,10 @@ fn draw_loading_hourglass(pen: &mut VirtualPen, calibration: &AffineTransform, p
 /// One animation frame: add a short radial tick around the hourglass. Called
 /// repeatedly while generating, they sweep round like a loading spinner. Circular
 /// so it's rotation-agnostic; additive (cleared with everything before the redraw).
-fn animate_loading(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64, frame: u32) {
+fn animate_loading_at(pen: &mut VirtualPen, calibration: &AffineTransform, pps: f64, frame: u32, cx: f32, cy: f32, k: f32) {
     use inkling_core::geometry::Stroke;
-    let (cx, cy) = (LOAD_CX, LOAD_CY);
-    // Ring sits well clear of the hourglass corners (~104px from centre) so the
-    // spinner ticks don't crowd it.
-    let (r0, r1) = (150.0_f32, 180.0_f32);
+    // Ring sits well clear of the hourglass corners so the spinner ticks don't crowd it.
+    let (r0, r1) = (150.0_f32 * k, LOAD_RADIUS * k);
     let ang = (frame % 12) as f32 * std::f32::consts::TAU / 12.0;
     let (ca, sa) = (ang.cos(), ang.sin());
     let mut s = Stroke::new();
@@ -548,26 +604,87 @@ fn draw_png(png: &[u8], calibration: &AffineTransform, config: &DaemonConfig) ->
 }
 
 // --- selection-convert mode ([mode] trigger = "selection") ---
-// File contract with the inklingfb extension + qmldiff "Convert" button:
-//   /tmp/inkling_convert_go : extension signals a convert is requested (bounds written)
-//   /tmp/inkling_selbounds  : "x y w h" — selection bbox in portrait framebuffer px
-//   /tmp/inklingfb_delsel   : daemon asks the extension to delete the selected strokes
+// File contract with the inklingfb extension + the "AI" selection-menu button:
+//   /tmp/inkling_convert_go   : extension signals a convert is requested
+//   /tmp/inkling_selinfo      : daemon asks for the native selection info; the
+//   /tmp/inkling_selinfo_out  :   extension replies "count x y w h portrait" (view px,
+//                                 tight bbox of the selected strokes — SceneSelection-
+//                                 Handler.viewSelectionRect — plus the DocumentView's
+//                                 portrait orientation flag)
+//   /tmp/inkling_seldelete    : daemon asks for the native delete — the extension emits
+//                                 the SceneSelectionHandler's deleteSelection() signal,
+//                                 i.e. exactly what the selection menu's trash button
+//                                 does (xochitl deletes with its own edit id, undoable)
 const CONVERT_GO: &str = "/tmp/inkling_convert_go";
-const SELBOUNDS: &str = "/tmp/inkling_selbounds";
-const DELSEL_TRIGGER: &str = "/tmp/inklingfb_delsel";
+const SELINFO_TRIGGER: &str = "/tmp/inkling_selinfo";
+const SELINFO_OUT: &str = "/tmp/inkling_selinfo_out";
+const SELDELETE_TRIGGER: &str = "/tmp/inkling_seldelete";
+const TOOL_TRIGGER: &str = "/tmp/inkling_tool"; // "pen" | "sel" — native penHandler switch
 
-fn read_selbounds() -> Result<(u32, u32, u32, u32)> {
-    let s = std::fs::read_to_string(SELBOUNDS).context("reading selection bounds")?;
-    let v: Vec<u32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-    anyhow::ensure!(v.len() == 4, "selection bounds must be 'x y w h', got {s:?}");
-    Ok((v[0], v[1], v[2], v[3]))
+/// White-out the selection UI's chrome captured inside the crop: the rectangle's
+/// black border line (runs along every edge) and the handles that straddle it
+/// (squares on the corners, rotate circle at top-centre). Without this the model
+/// sees a framed sketch and draws the frame into the illustration.
+fn mask_selection_ui(crop: &mut image::GrayImage) {
+    let (w, h) = crop.dimensions();
+    let mut fill = |x0: u32, y0: u32, fw: u32, fh: u32| {
+        for y in y0..(y0 + fh).min(h) {
+            for x in x0..(x0 + fw).min(w) {
+                crop.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+    };
+    const EDGE: u32 = 6; // the border line itself
+    const HANDLE: u32 = 26; // half of a corner square that reaches inside the rect
+    const ROT_W: u32 = 60; // rotate-circle intrusion at top-centre
+    const ROT_H: u32 = 30;
+    fill(0, 0, w, EDGE); // top edge
+    fill(0, h.saturating_sub(EDGE), w, EDGE); // bottom edge
+    fill(0, 0, EDGE, h); // left edge
+    fill(w.saturating_sub(EDGE), 0, EDGE, h); // right edge
+    fill(0, 0, HANDLE, HANDLE); // corners
+    fill(w.saturating_sub(HANDLE), 0, HANDLE, HANDLE);
+    fill(0, h.saturating_sub(HANDLE), HANDLE, HANDLE);
+    fill(w.saturating_sub(HANDLE), h.saturating_sub(HANDLE), HANDLE, HANDLE);
+    fill(w.saturating_sub(ROT_W) / 2, 0, ROT_W, ROT_H); // rotate handle, top-centre
+}
+
+/// Ask the extension for the live selection's native bounds (view px), stroke
+/// count, and the document's portrait flag. Returns None if there's no live
+/// selection (count 0) or no reply.
+fn native_selection_bounds() -> Option<(u32, u32, u32, u32, bool)> {
+    let _ = std::fs::remove_file(SELINFO_OUT);
+    std::fs::write(SELINFO_TRIGGER, []).ok()?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        let Ok(s) = std::fs::read_to_string(SELINFO_OUT) else { continue };
+        let v: Vec<f64> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if v.len() >= 5 && v[0] >= 1.0 && v[3] >= 4.0 && v[4] >= 4.0 {
+            let x = v[1].max(0.0) as u32;
+            let y = v[2].max(0.0) as u32;
+            let w = (v[3] as u32).min(cap::WIDTH.saturating_sub(x));
+            let h = (v[4] as u32).min(cap::HEIGHT.saturating_sub(y));
+            let portrait = v.get(5).copied().unwrap_or(0.0) >= 0.5;
+            log::info!("native selection: {} item(s), view rect [{x} {y} {w} {h}], portrait={portrait}", v[0]);
+            return Some((x, y, w, h, portrait));
+        }
+        return None; // replied, but no live selection
+    }
+    None
 }
 
 /// Draw an illustration fitted into a selection bounding box (portrait page px).
-fn draw_png_bounds(png: &[u8], region: (u32, u32, u32, u32), calibration: &AffineTransform, config: &DaemonConfig) -> Result<()> {
+/// `landscape` matches the orientation the sketch PNG was prepared in.
+fn draw_png_bounds(
+    png: &[u8],
+    region: (u32, u32, u32, u32),
+    landscape: bool,
+    calibration: &AffineTransform,
+    config: &DaemonConfig,
+) -> Result<()> {
     let tmp = "/tmp/inkling_draw.png";
     std::fs::write(tmp, png)?;
-    let (vec_result, _, _) = crate::vectorize_for_bounds(tmp, true, config.max_points, region)?;
+    let (vec_result, _, _) = crate::vectorize_for_bounds(tmp, landscape, config.max_points, region)?;
     log::info!("drawing {} strokes into selection...", vec_result.strokes.len());
     let mut pen = VirtualPen::open_existing(PEN_NODE)?;
     pen.tool_in(Tool::Pen)?;
@@ -579,47 +696,181 @@ fn draw_png_bounds(png: &[u8], region: (u32, u32, u32, u32), calibration: &Affin
     Ok(())
 }
 
-/// One selection→illustration conversion: crop the capture to the selection bounds,
-/// archive before, generate, archive after, delete the selected strokes, draw fitted.
+/// The spinner is drawn on a temporary scratch LAYER (extension trigger
+/// "begin"/"end"): removing it is a plain native deleteLayer. Never remove it by
+/// programmatic selection + deleteSelection — that crashed xochitl twice.
+const SPINLAYER_TRIGGER: &str = "/tmp/inkling_spinlayer";
+
+const LAYERQ_TRIGGER: &str = "/tmp/inkling_layerq";
+const LAYER_OUT: &str = "/tmp/inkling_layer_out";
+
+/// Read the extension's live layer state as (currentLayer, layerCount).
+fn query_layer() -> Option<(i32, i32)> {
+    let _ = std::fs::remove_file(LAYER_OUT);
+    std::fs::write(LAYERQ_TRIGGER, []).ok()?;
+    for _ in 0..15 {
+        std::thread::sleep(Duration::from_millis(40));
+        let Ok(s) = std::fs::read_to_string(LAYER_OUT) else { continue };
+        let v: Vec<i32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+        if v.len() >= 2 {
+            return Some((v[0], v[1]));
+        }
+    }
+    None
+}
+
+/// Send a spinlayer command and WAIT until the layer switch has actually landed.
+/// setCurrentLayer is applied by a deferred internal event, so a fixed sleep races
+/// it — the spinner then inked the user's own layer and survived cleanup. `begin`
+/// waits for the layer count to grow (the scratch layer exists and is current);
+/// `end` waits for it to shrink back. Returns false on timeout.
+fn spinlayer(cmd: &[u8]) -> bool {
+    let baseline = query_layer().map(|(_, n)| n).unwrap_or(1);
+    let _ = std::fs::write(SPINLAYER_TRIGGER, cmd);
+    let want_grow = cmd == b"begin";
+    let deadline = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(60));
+        if let Some((cur, count)) = query_layer() {
+            let settled = if want_grow {
+                count > baseline && cur == count - 1 // scratch layer added and current
+            } else {
+                count < baseline // scratch layer gone
+            };
+            if settled {
+                std::thread::sleep(Duration::from_millis(120)); // brief post-switch settle
+                return true;
+            }
+        }
+    }
+    log::warn!("spinlayer {:?} did not confirm within 2.5s", String::from_utf8_lossy(cmd));
+    false
+}
+
+/// One selection→illustration conversion: grab the screen, read the native selection
+/// bounds, clean the crop, generate, delete the strokes natively, draw fitted.
 fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
-    let (mut bx, mut by, mut bw, mut bh) = read_selbounds()?;
     let frame = cap::capture_now()?;
     if looks_like_garbage(&frame) {
-        anyhow::bail!("capture looks like noise (framebuffer mis-aligned or panel asleep) — aborting convert");
+        anyhow::bail!("capture looks like noise — aborting convert");
     }
-    // Clamp the region to the frame so an off/oversized bbox can't panic the crop.
-    let (fw, fh) = (frame.width(), frame.height());
-    bx = bx.min(fw.saturating_sub(1));
-    by = by.min(fh.saturating_sub(1));
-    bw = bw.min(fw - bx).max(1);
-    bh = bh.min(fh - by).max(1);
-    log::info!("converting selection {bw}x{bh} at ({bx},{by})");
+    let (bx, by, bw, bh, doc_portrait) = native_selection_bounds()
+        .context("no selection detected (select some strokes, then tap AI)")?;
+    // The model must see the sketch the way the artist drew it. The document's
+    // orientation setting (xochitl's ⋯ menu → Landscape/Portrait) says how the
+    // tablet is held; config [mode] orientation can pin it instead of following.
+    let landscape = match config.orientation {
+        Orientation::Landscape => true,
+        Orientation::Portrait => false,
+        Orientation::Auto => !doc_portrait,
+    };
+    log::info!("converting selection {bw}x{bh} at ({bx},{by}), {} input", if landscape { "landscape" } else { "portrait" });
 
-    // History, named by timestamp. BEFORE = the whole screen (landscape view).
+    // History, named by timestamp. BEFORE = the whole screen, artist-oriented.
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     std::fs::create_dir_all(&config.archive_dir).ok();
-    let _ = save_gray_png(&image::imageops::rotate270(&frame), &format!("{}/{ts}-before.png", config.archive_dir));
+    let before = if landscape { image::imageops::rotate270(&frame) } else { frame.clone() };
+    let _ = save_gray_png(&before, &format!("{}/{ts}-before.png", config.archive_dir));
 
-    // The model only gets the selection crop (→ landscape drawing view).
-    let crop = image::imageops::crop_imm(&frame, bx, by, bw, bh).to_image();
-    let land = image::imageops::rotate270(&crop);
+    // Crop the selection and clean it: the grey overlay + paper go white, ink stays
+    // black, so the model gets a clean sketch.
+    let mut crop = image::imageops::crop_imm(&frame, bx, by, bw, bh).to_image();
+    for p in crop.pixels_mut() {
+        p.0[0] = if p.0[0] < 150 { 0 } else { 255 };
+    }
+    // The capture includes the selection UI's black chrome — the rectangle's border
+    // line and the corner/rotate handles. Left in, the model faithfully draws a
+    // frame box around the illustration. White them out.
+    mask_selection_ui(&mut crop);
+    // White breathing margin: a tight crop reads as "fill every pixel" and the model
+    // comes back denser/muddier than the old full-page flow (which had paper around
+    // the sketch). The redraw region is expanded by the same amounts, so the
+    // illustration lands exactly where the sketch was.
+    let pad_x = (bw as f32 * 0.12) as u32 + 16;
+    let pad_y = (bh as f32 * 0.12) as u32 + 16;
+    let mut padded = image::GrayImage::from_pixel(bw + 2 * pad_x, bh + 2 * pad_y, image::Luma([255]));
+    image::imageops::replace(&mut padded, &crop, pad_x as i64, pad_y as i64);
+    let ex = bx.saturating_sub(pad_x);
+    let ey = by.saturating_sub(pad_y);
+    let ew = (bw + 2 * pad_x).min(cap::WIDTH - ex);
+    let eh = (bh + 2 * pad_y).min(cap::HEIGHT - ey);
+    let draw_region = (ex, ey, ew, eh);
+    let oriented = if landscape { image::imageops::rotate270(&padded) } else { padded };
     let mut sketch_png = Vec::new();
-    image::DynamicImage::ImageLuma8(land)
+    image::DynamicImage::ImageLuma8(oriented)
         .write_to(&mut std::io::Cursor::new(&mut sketch_png), image::ImageFormat::Png)?;
+    // Archive the EXACT model input, so "what did it see?" is always answerable.
+    std::fs::write(format!("{}/{ts}-sketch.png", config.archive_dir), &sketch_png).ok();
 
+    // Generate on a thread so the spinner can run during the API round-trip.
     log::info!("generating illustration...");
-    let illus = client.sketch_to_illustration(&sketch_png)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let client = client.clone();
+        let png = sketch_png.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(client.sketch_to_illustration(&png));
+        });
+    }
 
-    // Remove the user's sketch strokes (the extension deletes the live selection),
-    // let the e-ink settle, then draw the illustration into the same bounds.
-    std::fs::write(DELSEL_TRIGGER, []).ok();
-    std::thread::sleep(Duration::from_millis(900));
-    draw_png_bounds(&illus, (bx, by, bw, bh), calibration, config)?;
+    // Native delete: emit the selection menu's own deleteSelection() via the
+    // extension — identical to tapping the trash button (correct internal edit id,
+    // clean e-ink refresh, undoable), and it closes the selection so the following
+    // pen inject draws ink rather than dragging the selection.
+    std::fs::write(SELDELETE_TRIGGER, []).ok();
+    std::thread::sleep(Duration::from_millis(700));
+
+    // The user selected with the SELECTION tool, and with it active the injected pen
+    // strokes are treated as lasso gestures, not ink. Native switch: the extension
+    // writes penHandler.{lineTool,gestureMode,lineThickness} on the GUI thread.
+    std::fs::write(TOOL_TRIGGER, b"pen").ok();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Loading spinner on a scratch layer, so removal is a single native deleteLayer.
+    // Only draw it if the layer switch is CONFIRMED — otherwise the spinner would ink
+    // the artist's own layer and survive cleanup (a stray hourglass on the drawing).
+    let (scx, scy) = ((bx + bw / 2) as f32, (by + bh / 2) as f32);
+    let k = ((bw.min(bh) as f32) / 2.0 - 10.0).clamp(60.0, LOAD_RADIUS) / LOAD_RADIUS;
+    let on_scratch = spinlayer(b"begin");
+    let gen = if on_scratch {
+        let mut _drawn = false;
+        let g = wait_with_hourglass_at(&rx, calibration, config, scx, scy, k, landscape, &mut _drawn);
+        // Drop the scratch layer (and the spinner with it). Wait for it to actually
+        // go before drawing — else the illustration lands on the doomed layer.
+        if !spinlayer(b"end") {
+            log::warn!("scratch layer not confirmed gone; skipping spinner cleanup wait");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        g
+    } else {
+        // No confirmed scratch layer — skip the spinner rather than risk a stray mark;
+        // just wait for the illustration.
+        log::warn!("scratch layer not confirmed; drawing without spinner");
+        rx.recv().unwrap_or_else(|_| anyhow::bail!("generation thread died"))
+    };
+
+    let result = match gen {
+        Ok(illus) => draw_png_bounds(&illus, draw_region, landscape, calibration, config),
+        Err(e) => {
+            // Generation failed AFTER the selection was deleted — put the sketch
+            // back (redrawn from our cleaned crop) so the kid never loses a drawing
+            // to a network/API error. The delete also stays undoable.
+            log::warn!("generation failed ({e:#}); restoring the sketch");
+            draw_png_bounds(&sketch_png, draw_region, landscape, calibration, config)
+                .map_err(|re| re.context("restore-redraw also failed"))
+                .and(Err(e))
+        }
+    };
+    // Finish on the PEN tool (toolbar tap so the highlight moves too) — the kid can
+    // keep drawing right away instead of accidentally lassoing.
+    touch::tap(55, 170).ok();
+    result?;
 
     // AFTER = the whole screen once the illustration is on the page.
     std::thread::sleep(Duration::from_millis(500));
     if let Ok(after) = cap::capture_now() {
-        let _ = save_gray_png(&image::imageops::rotate270(&after), &format!("{}/{ts}-after.png", config.archive_dir));
+        let oriented_after = if landscape { image::imageops::rotate270(&after) } else { after };
+        let _ = save_gray_png(&oriented_after, &format!("{}/{ts}-after.png", config.archive_dir));
     }
     log::info!("selection convert complete");
     Ok(())
@@ -634,12 +885,41 @@ fn save_gray_png(img: &image::GrayImage, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Selection-driven loop: wait for the extension/qmldiff button to request a convert.
+/// The injected Convert button (a QML star in xochitl's selection menu) fires an XHR
+/// here; any request touches the CONVERT_GO file the main loop polls.
+fn spawn_convert_listener() {
+    std::thread::spawn(|| {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:9137") {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("convert listener bind failed ({e}); button taps won't work");
+                return;
+            }
+        };
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 512];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            if buf.starts_with(b"GET /convert") {
+                let _ = std::fs::write(CONVERT_GO, []);
+                log::info!("convert requested (menu button)");
+            }
+            let _ = std::io::Write::write_all(
+                &mut s,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        }
+    });
+}
+
+/// Selection-driven loop: wait for the Convert menu button (or a manual touch of the
+/// trigger file) to request a convert.
 fn run_selection_mode(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
     log::info!(
         "inkling daemon started (SELECTION mode, model {})",
         config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL)
     );
+    spawn_convert_listener();
     let _ = std::fs::remove_file(CONVERT_GO); // ignore a stale request from a prior run
     loop {
         if std::path::Path::new(CONVERT_GO).exists() {
@@ -647,17 +927,25 @@ fn run_selection_mode(config: &DaemonConfig, client: &OpenRouterClient, calibrat
                 log::error!("selection convert failed: {e:#}");
             }
             let _ = std::fs::remove_file(CONVERT_GO);
-            let _ = std::fs::remove_file(SELBOUNDS);
         }
         std::thread::sleep(Duration::from_millis(150));
     }
 }
 
 /// Wait for the illustration, showing the animated hourglass while it generates.
-fn wait_with_hourglass(
+/// Returns the PNG and whether the spinner was actually drawn (so callers that
+/// can't full-page-clear know they must remove it).
+/// `drawn` is set as soon as the spinner ink hits the page, so callers can clean
+/// it up even when this returns an error mid-wait.
+fn wait_with_hourglass_at(
     rx: &std::sync::mpsc::Receiver<Result<Vec<u8>>>,
     calibration: &AffineTransform,
     config: &DaemonConfig,
+    cx: f32,
+    cy: f32,
+    k: f32,
+    landscape: bool,
+    drawn: &mut bool,
 ) -> Result<Vec<u8>> {
     use std::sync::mpsc::TryRecvError;
     match rx.try_recv() {
@@ -668,13 +956,21 @@ fn wait_with_hourglass(
     log::info!("illustration not ready — showing loading indicator");
     let mut pen = VirtualPen::open_existing(PEN_NODE)?;
     pen.tool_in(Tool::Pen)?;
-    draw_loading_hourglass(&mut pen, calibration, config.draw_pps)?;
+    *drawn = true;
+    draw_loading_hourglass_at(&mut pen, calibration, config.draw_pps, cx, cy, k, landscape)?;
     let mut frame = 0u32;
     let png = loop {
         match rx.try_recv() {
             Ok(res) => break res?,
             Err(TryRecvError::Empty) => {
-                animate_loading(&mut pen, calibration, config.draw_pps, frame);
+                animate_loading_at(&mut pen, calibration, config.draw_pps, frame, cx, cy, k);
+                if frame == 1 {
+                    // The first outline is inked during the post-delete refresh dead
+                    // zone and the panel can skip it (it only "flashed" at the final
+                    // repaint). Ink it again once refreshes are flowing — overdraw
+                    // on the scratch layer is invisible and gets deleted anyway.
+                    let _ = draw_loading_hourglass_at(&mut pen, calibration, config.draw_pps, cx, cy, k, landscape);
+                }
                 frame = frame.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(550));
             }
@@ -686,6 +982,18 @@ fn wait_with_hourglass(
     };
     pen.tool_out()?;
     Ok(png)
+}
+
+/// Full-page variant (inactivity mode): spinner at the page centre; the caller
+/// clears the whole page afterwards, so the drawn/not-drawn flag is irrelevant.
+/// Inactivity mode is landscape-only, matching that flow's fixed rotation.
+fn wait_with_hourglass(
+    rx: &std::sync::mpsc::Receiver<Result<Vec<u8>>>,
+    calibration: &AffineTransform,
+    config: &DaemonConfig,
+) -> Result<Vec<u8>> {
+    let mut drawn = false;
+    wait_with_hourglass_at(rx, calibration, config, LOAD_CX, LOAD_CY, 1.0, true, &mut drawn)
 }
 
 /// One full magic cycle. On success the page holds the drawn illustration; on

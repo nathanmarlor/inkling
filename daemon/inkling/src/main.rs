@@ -45,6 +45,8 @@ enum Commands {
     /// Debug which injection path reaches the screen: uinput virtual
     /// device vs direct write to the real digitizer node (on-device only).
     PenDebug {},
+    /// Tap the touchscreen once at portrait framebuffer coords (on-device only).
+    Tap { x: u32, y: u32 },
     /// Run the magic-notebook daemon: watch for finished sketches, generate
     /// illustrations, dissolve, redraw (on-device only).
     Run {
@@ -124,6 +126,12 @@ fn main() -> Result<()> {
         Commands::Calibrate { out } => calibrate(&out),
         Commands::DrawTest { pps, calibration } => draw_test(pps, &calibration),
         Commands::PenDebug {} => pen_debug(),
+        Commands::Tap { x, y } => {
+            #[cfg(target_os = "linux")]
+            { crate::device::touch::tap(x, y) }
+            #[cfg(not(target_os = "linux"))]
+            { let _ = (x, y); anyhow::bail!("tap runs on the reMarkable only") }
+        }
         Commands::Dissolve { block_px, spacing, pps, seed, calibration } => dissolve(block_px, spacing, pps, seed, &calibration),
         Commands::EraseProbe { calibration } => erase_probe(&calibration),
         Commands::Fade { pps, seed, calibration } => fade(pps, seed, &calibration),
@@ -340,6 +348,14 @@ fn run_daemon(config_path: &str) -> Result<()> {
                     "selection" => daemon::TriggerMode::Selection,
                     "inactivity" => daemon::TriggerMode::Inactivity,
                     other => anyhow::bail!("unknown [mode] trigger = {other:?} (want \"inactivity\" or \"selection\")"),
+                };
+            }
+            if let Some(o) = gets("mode", "orientation") {
+                cfg.orientation = match o.to_ascii_lowercase().as_str() {
+                    "auto" => daemon::Orientation::Auto,
+                    "landscape" => daemon::Orientation::Landscape,
+                    "portrait" => daemon::Orientation::Portrait,
+                    other => anyhow::bail!("unknown [mode] orientation = {other:?} (want \"auto\", \"landscape\" or \"portrait\")"),
                 };
             }
         }
