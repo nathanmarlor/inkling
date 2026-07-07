@@ -734,118 +734,139 @@ fn detect_selection_bounds(img: &image::GrayImage) -> Option<(u32, u32, u32, u32
     Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
-/// Handwritten-question path: render the answer and ink it just below the question,
-/// leaving the question itself in place. Portrait-oriented (the answer is drawn
-/// upright in panel space); the question stays selected-then-deselected as we switch
-/// to the pen. `sel` is the question's panel-px bbox (bx, by, bw, bh).
+/// Handwritten-question path: ink the answer just below the question, leaving the
+/// question in place. The answer is drawn from the font's own glyph OUTLINES as pen
+/// strokes (clean, connected letters) — rasterising then skeleton-tracing broke the
+/// letters into spidery fragments. `sel` is the question's panel-px bbox.
 fn answer_question(
     answer: &str,
     sel: (u32, u32, u32, u32),
     _landscape: bool,
     calibration: &AffineTransform,
     config: &DaemonConfig,
-    ts: u64,
+    _ts: u64,
 ) -> Result<()> {
     let (bx, by, bw, bh) = sel;
     let width = bw.max(240).min(cap::WIDTH.saturating_sub(bx)).max(1);
-    let (png, text_h) = render_text_png(answer, width, &config.answer_font)?;
-    std::fs::write(format!("{}/{ts}-answer.png", config.archive_dir), &png).ok();
-
-    // Region directly below the question, clamped to the page.
     let gap = 24;
-    let ry = (by + bh + gap).min(cap::HEIGHT - 1);
-    let rh = text_h.min(cap::HEIGHT.saturating_sub(ry)).max(1);
-    let region = (bx, ry, width, rh);
+    let ox = bx as f32 + 6.0;
+    let oy = (by + bh + gap) as f32;
+    let strokes = text_outline_strokes(answer, ox, oy, width as f32 - 12.0, &config.answer_font)?;
 
     // Deselect the question WITHOUT deleting it, then draw. A real toolbar tap on the
     // pen tool both switches tool and clears the active selection — the native
     // property tool-switch does NOT deselect, so injecting the answer while the
-    // question was still selected dragged/cut it (the question vanished). Tap the pen
-    // icon, give the selection time to clear, then ink the answer.
+    // question was still selected dragged/cut it (the question vanished).
     touch::tap(55, 170).ok();
     std::thread::sleep(Duration::from_millis(600));
-    draw_png_bounds(&png, region, false, calibration, config)?;
-    log::info!("answer inked below the question");
+    let mut pen = VirtualPen::open_existing(PEN_NODE)?;
+    pen.tool_in(Tool::Pen)?;
+    for s in &strokes {
+        let dense = crate::on_device::densify(s, 3.0);
+        pen.stroke_display(&dense, calibration, config.draw_pps)?;
+    }
+    pen.tool_out()?;
+    log::info!("answer inked below the question ({} strokes)", strokes.len());
     Ok(())
 }
 
-/// Render `text` as black-on-white word-wrapped lines to a PNG `width_px` wide, using
-/// the TTF at `font_path`. Returns the PNG bytes and the rendered pixel height.
-fn render_text_png(text: &str, width_px: u32, font_path: &str) -> Result<(Vec<u8>, u32)> {
-    use ab_glyph::{point, Font, FontVec, Glyph, PxScale, ScaleFont};
-    let data = std::fs::read(font_path).with_context(|| format!("reading font {font_path}"))?;
-    let font = FontVec::try_from_vec(data).context("parsing font")?;
-    let px = 46.0_f32;
-    let scale = PxScale::from(px);
-    let sf = font.as_scaled(scale);
-    let line_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil();
-    let margin = 8.0_f32;
-    let max_w = (width_px as f32 - 2.0 * margin).max(1.0);
+/// One Hershey glyph: horizontal advance (font units) and a set of pen strokes, each
+/// a polyline in font units (origin at the left edge, y increasing downward).
+struct HersheyGlyph {
+    advance: f32,
+    strokes: Vec<Vec<(f32, f32)>>,
+}
 
-    // Word-wrap: measure each word's advance and break lines that overflow.
-    let advance = |s: &str| -> f32 {
-        let mut w = 0.0;
-        let mut prev: Option<char> = None;
-        for c in s.chars() {
-            if let Some(p) = prev { w += sf.kern(font.glyph_id(p), font.glyph_id(c)); }
-            w += sf.h_advance(font.glyph_id(c));
-            prev = Some(c);
+/// The vendored Hershey "futural" single-stroke (plotter) font. Parsed once. ASCII
+/// 32..=126 map to the file's lines in order. Single-stroke = each letter is drawn
+/// with centre-line strokes like handwriting, not hollow outlines.
+fn hershey_font() -> &'static std::collections::HashMap<char, HersheyGlyph> {
+    use std::sync::OnceLock;
+    static FONT: OnceLock<std::collections::HashMap<char, HersheyGlyph>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        const DATA: &str = include_str!("futural.jhf");
+        let mut map = std::collections::HashMap::new();
+        for (i, line) in DATA.lines().enumerate() {
+            let ch = char::from_u32(32 + i as u32).unwrap_or(' ');
+            let bytes = line.as_bytes();
+            if bytes.len() < 10 { map.insert(ch, HersheyGlyph { advance: 16.0, strokes: vec![] }); continue; }
+            // bytes[8],[9] = left/right bearing (char - 'R').
+            let left = bytes[8] as f32 - (b'R' as f32);
+            let right = bytes[9] as f32 - (b'R' as f32);
+            let mut strokes: Vec<Vec<(f32, f32)>> = Vec::new();
+            let mut cur: Vec<(f32, f32)> = Vec::new();
+            let mut j = 10;
+            while j + 1 < bytes.len() {
+                let (a, b) = (bytes[j], bytes[j + 1]);
+                if a == b' ' {
+                    // pen up — end current stroke
+                    if cur.len() > 1 { strokes.push(std::mem::take(&mut cur)); } else { cur.clear(); }
+                } else {
+                    cur.push((a as f32 - (b'R' as f32) - left, b as f32 - (b'R' as f32)));
+                }
+                j += 2;
+            }
+            if cur.len() > 1 { strokes.push(cur); }
+            map.insert(ch, HersheyGlyph { advance: right - left, strokes });
         }
-        w
+        map
+    })
+}
+
+/// Lay `text` out word-wrapped to `max_w` (px) starting at panel px (ox, oy) and
+/// return single-stroke Hershey letters as display-space pen strokes.
+fn text_outline_strokes(text: &str, ox: f32, oy: f32, max_w: f32, _font_path: &str) -> Result<Vec<inkling_core::geometry::Stroke>> {
+    use inkling_core::geometry::Stroke;
+    let font = hershey_font();
+    // Hershey cap height is ~21 units; scale so caps are ~40px tall.
+    let scale = 40.0 / 21.0;
+    let line_h = 34.0 * scale; // generous line spacing (units) * scale
+    let space_adv = font.get(&' ').map(|g| g.advance).unwrap_or(16.0);
+
+    let word_w = |w: &str| -> f32 {
+        w.chars().map(|c| font.get(&c).map(|g| g.advance).unwrap_or(space_adv)).sum::<f32>() * scale
     };
-    let space_w = advance(" ");
+    let space_w = space_adv * scale * 1.3;
+
+    // Word-wrap.
     let mut lines: Vec<String> = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
-        let mut line_w = 0.0;
+        let mut lw = 0.0;
         for word in para.split_whitespace() {
-            let ww = advance(word);
-            if !line.is_empty() && line_w + space_w + ww > max_w {
+            let ww = word_w(word);
+            if !line.is_empty() && lw + space_w + ww > max_w {
                 lines.push(std::mem::take(&mut line));
-                line_w = 0.0;
+                lw = 0.0;
             }
-            if !line.is_empty() {
-                line.push(' ');
-                line_w += space_w;
-            }
+            if !line.is_empty() { line.push(' '); lw += space_w; }
             line.push_str(word);
-            line_w += ww;
+            lw += ww;
         }
         lines.push(line);
     }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
 
-    let height = (line_h * lines.len() as f32 + 2.0 * margin).ceil() as u32;
-    let mut img = image::GrayImage::from_pixel(width_px, height.max(1), image::Luma([255]));
-    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let mut out = Vec::new();
     for (li, line) in lines.iter().enumerate() {
-        let baseline = margin + sf.ascent() + li as f32 * line_h;
-        let mut caret = margin;
-        let mut prev: Option<char> = None;
+        // Hershey baseline is at y=0 with caps going negative; place the baseline so
+        // the tallest caps (~ -21) sit below oy.
+        let base_y = oy + 21.0 * scale + li as f32 * line_h;
+        let mut caret = ox;
         for c in line.chars() {
-            let id = font.glyph_id(c);
-            if let Some(p) = prev { caret += sf.kern(font.glyph_id(p), id); }
-            let g: Glyph = id.with_scale_and_position(scale, point(caret, baseline));
-            if let Some(og) = font.outline_glyph(g) {
-                let bb = og.px_bounds();
-                og.draw(|dx, dy, cov| {
-                    let x = bb.min.x as i32 + dx as i32;
-                    let y = bb.min.y as i32 + dy as i32;
-                    if x >= 0 && y >= 0 && x < iw && y < ih && cov > 0.35 {
-                        img.put_pixel(x as u32, y as u32, image::Luma([0]));
+            if c == ' ' { caret += space_w; continue; }
+            if let Some(g) = font.get(&c) {
+                for poly in &g.strokes {
+                    let mut st = Stroke::new();
+                    for (x, y) in poly {
+                        st.push(caret + x * scale, base_y + y * scale, 0.85);
                     }
-                });
+                    out.push(st);
+                }
+                caret += g.advance * scale;
             }
-            caret += sf.h_advance(id);
-            prev = Some(c);
         }
     }
-    let mut png = Vec::new();
-    image::DynamicImage::ImageLuma8(img)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
-    Ok((png, height))
+    Ok(out)
 }
 
 /// Draw an artist-upright illustration fitted into a selection bounding box (panel
