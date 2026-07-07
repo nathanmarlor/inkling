@@ -11,7 +11,7 @@ entry points — **no function hooks**, which is what keeps it stable.
 [inklingfb] selinfo count=228 rect=[334.0 527.0 865.0 1092.0] portrait=0
 [inklingfb] convert button attached beside menu (w=324)
 [inklingfb] spinlayer begin (scratch=1, prev=0)
-[inklingfb] spinlayer end (deleted 1, current 0)
+[inklingfb] spinlayer end (deleted 1, restored 0)
 ```
 
 ## Architecture (each rule paid for with a device freeze or crash)

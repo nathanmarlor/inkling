@@ -427,17 +427,6 @@ static int read_int_prop(void *o, const char *name, int dflt){
     int r = p_v_toint(v, 0); if(p_v_dtor) p_v_dtor(v);
     return r;
 }
-// Write the live currentLayer so the daemon can confirm a switch really landed
-// (setCurrentLayer is applied by a queued/deferred internal event, so a fixed sleep
-// races it — the spinner then inked the user's own layer and survived cleanup).
-static void write_layer_state(void *sc){
-    FILE *fp = fopen("/tmp/inkling_layer_out.tmp","w");
-    if(!fp) return;
-    fprintf(fp, "%d %d %d\n", read_int_prop(sc, "currentLayer", -1),
-            read_int_prop(sc, "layerCount", -1), g_spin_layer);
-    fclose(fp);
-    rename("/tmp/inkling_layer_out.tmp","/tmp/inkling_layer_out");
-}
 static void spin_layer(void){
     char cmd[8]={0};
     FILE *tf = fopen("/tmp/inkling_spinlayer","r");
@@ -447,8 +436,10 @@ static void spin_layer(void){
     void *sc = g_scs[0];
     GA z = {0,0};
     // QUEUED invokes (type 2): a Direct invoke of setCurrentLayer left currentLayer
-    // unchanged on readback (its effect is internally deferred), so Direct buys no
-    // guarantee. The daemon confirms the switch via write_layer_state before inking.
+    // unchanged on readback (its effect is internally deferred). The daemon just waits
+    // a fixed beat after this trigger is consumed — a layerCount-readback confirm was
+    // tried and removed (the count readback is also deferred so it never confirmed,
+    // and its rapid re-polling wedged the panel).
     if(!strcmp(cmd,"begin")){
         g_prev_layer = read_int_prop(sc, "currentLayer", 0);
         int n = read_int_prop(sc, "layerCount", 1);
@@ -467,11 +458,6 @@ static void spin_layer(void){
     }
     for(int i=0;i<g_nviews;i++)
         p_invoke(g_views[i], "update", 2, z,z,z,z,z,z,z,z,z,z,z);
-}
-// Lightweight readback: touch /tmp/inkling_layerq -> writes currentLayer state.
-static void layer_query(void){
-    locate();
-    if(g_nscs) write_layer_state(g_scs[0]);
 }
 
 // THE clean native delete: emit the SceneSelectionHandler's deleteSelection() signal —
@@ -684,7 +670,7 @@ static const char *TRIGGERS[] = {
     "/tmp/inklingfb_clear",
     "/tmp/inkling_probe", "/tmp/inkling_seldelete",
     "/tmp/inkling_selinfo", "/tmp/inkling_selrect", "/tmp/inkling_spinlayer",
-    "/tmp/inkling_layerq", "/tmp/inkling_tool", 0
+    "/tmp/inkling_tool", 0
 };
 static void gui_process(void){   // GUI THREAD ONLY
     if(access("/tmp/inkling_tool", F_OK)==0){
@@ -700,7 +686,6 @@ static void gui_process(void){   // GUI THREAD ONLY
     if(access("/tmp/inkling_selinfo",  F_OK)==0){ selection_info();        unlink("/tmp/inkling_selinfo"); }
     if(access("/tmp/inkling_selrect",  F_OK)==0){ select_rect();      unlink("/tmp/inkling_selrect"); }
     if(access("/tmp/inkling_spinlayer",F_OK)==0){ spin_layer();       unlink("/tmp/inkling_spinlayer"); }
-    if(access("/tmp/inkling_layerq",   F_OK)==0){ layer_query();      unlink("/tmp/inkling_layerq"); }
     // keep the Convert button present (no-op when the menu is absent or already has it)
     if(p_qcomp_ctor) gui_add_convert_button();
 }

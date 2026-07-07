@@ -2,16 +2,26 @@
 
 [imagegen]
 api_key = "sk-or-REPLACE-ME"          # your OpenRouter API key
-model   = "google/gemini-2.5-flash-image"
+model   = "google/gemini-2.5-flash-image"   # image model for the illustration path
 
-[watch]
-dwell_s        = 3.0                    # quiet seconds after you stop drawing before it fires
-rate_limit_s   = 15.0                   # minimum gap between requests
-min_new_ink_px = 400                    # ignore trivial marks (pixels of fresh ink)
+[mode]
+trigger     = "selection"             # "selection" (lasso + AI button) or "inactivity"
+                                      #   (auto-fire the whole page after a quiet period)
+orientation = "auto"                  # how the tablet is held, for the selection flow:
+                                      #   "portrait" (default, the only fully-correct
+                                      #   orientation), "landscape", or "auto" (follow
+                                      #   the document's orientation; pin it if it
+                                      #   flip-flops)
 
 [ink]
-draw_pps   = 800.0                      # pen-stroke injection speed (points/sec)
-max_points = 6000                       # cap on injected points per illustration
+draw_pps   = 4000.0                    # pen-stroke injection speed (points/sec)
+max_points = 30000                     # cap on injected points per illustration
+
+# Only used by "inactivity" mode:
+[watch]
+dwell_s        = 2.0                    # quiet seconds after you stop drawing before it fires
+rate_limit_s   = 15.0                   # minimum gap between requests
+min_new_ink_px = 200                    # ignore trivial marks (pixels of fresh ink)
 
 [archive]
 dir = "/home/root/.local/share/inkling" # keeps a copy of each sketch + result

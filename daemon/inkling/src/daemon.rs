@@ -71,8 +71,6 @@ pub struct DaemonConfig {
     pub pause_file: String,
     pub trigger_mode: TriggerMode,
     pub orientation: Orientation,
-    /// TTF used to render handwritten-question answers back onto the page.
-    pub answer_font: String,
 }
 
 impl Default for DaemonConfig {
@@ -96,8 +94,6 @@ impl Default for DaemonConfig {
             // Portrait is the only coordinate-correct selection orientation (see the
             // Orientation note). `landscape`/`auto` are opt-in via [mode] orientation.
             orientation: Orientation::Portrait,
-            // reMarkable ships Noto Sans; readable and already on the device.
-            answer_font: "/usr/share/fonts/ttf/noto/NotoSans-Regular.ttf".into(),
         }
     }
 }
@@ -623,7 +619,23 @@ const CONVERT_GO: &str = "/tmp/inkling_convert_go";
 const SELINFO_TRIGGER: &str = "/tmp/inkling_selinfo";
 const SELINFO_OUT: &str = "/tmp/inkling_selinfo_out";
 const SELDELETE_TRIGGER: &str = "/tmp/inkling_seldelete";
-const TOOL_TRIGGER: &str = "/tmp/inkling_tool"; // "pen" | "sel" — native penHandler switch
+// Native penHandler tool switch. Only "pen" is used — asserted before injecting the
+// illustration so the strokes are ink, not lasso gestures (the selection tool stays
+// visually highlighted; select_pen_tool() moves the highlight at the very end). The
+// extension also accepts "sel", unused here.
+const TOOL_TRIGGER: &str = "/tmp/inkling_tool";
+
+/// Y of the pen (ballpoint) icon in the left toolbar; the first tool below the
+/// undo/settings dot.
+const PEN_TOOL_XY: (u32, u32) = (55, 170);
+
+/// Select the pen tool via a real toolbar tap. This both switches the drawing tool
+/// AND clears any active selection AND moves the toolbar highlight — the native
+/// penHandler property write does none of those reliably. Used to leave the user on
+/// the pen at the end of a convert, and to deselect before injecting ink.
+fn select_pen_tool() {
+    touch::tap(PEN_TOOL_XY.0, PEN_TOOL_XY.1).ok();
+}
 
 /// White-out the selection UI's chrome captured inside the crop: the rectangle's
 /// black border line (runs along every edge) and the handles that straddle it
@@ -751,13 +763,12 @@ fn answer_question(
     let gap = 24;
     let ox = bx as f32 + 6.0;
     let oy = (by + bh + gap) as f32;
-    let strokes = text_outline_strokes(answer, ox, oy, width as f32 - 12.0, &config.answer_font)?;
+    let strokes = text_hershey_strokes(answer, ox, oy, width as f32 - 12.0);
 
-    // Deselect the question WITHOUT deleting it, then draw. A real toolbar tap on the
-    // pen tool both switches tool and clears the active selection — the native
-    // property tool-switch does NOT deselect, so injecting the answer while the
-    // question was still selected dragged/cut it (the question vanished).
-    touch::tap(55, 170).ok();
+    // Deselect the question WITHOUT deleting it (select_pen_tool clears the selection
+    // and switches to the pen so the injected answer is ink, not a lasso gesture that
+    // would drag/cut the still-selected question). This also leaves the user on the pen.
+    select_pen_tool();
     std::thread::sleep(Duration::from_millis(600));
     let mut pen = VirtualPen::open_existing(PEN_NODE)?;
     pen.tool_in(Tool::Pen)?;
@@ -815,7 +826,7 @@ fn hershey_font() -> &'static std::collections::HashMap<char, HersheyGlyph> {
 
 /// Lay `text` out word-wrapped to `max_w` (px) starting at panel px (ox, oy) and
 /// return single-stroke Hershey letters as display-space pen strokes.
-fn text_outline_strokes(text: &str, ox: f32, oy: f32, max_w: f32, _font_path: &str) -> Result<Vec<inkling_core::geometry::Stroke>> {
+fn text_hershey_strokes(text: &str, ox: f32, oy: f32, max_w: f32) -> Vec<inkling_core::geometry::Stroke> {
     use inkling_core::geometry::Stroke;
     let font = hershey_font();
     // Hershey cap height is ~21 units; scale so caps are ~40px tall.
@@ -866,7 +877,7 @@ fn text_outline_strokes(text: &str, ox: f32, oy: f32, max_w: f32, _font_path: &s
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// Draw an artist-upright illustration fitted into a selection bounding box (panel
@@ -1062,9 +1073,11 @@ fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibrati
                 .and(Err(e))
         }
     };
-    // Finish on the PEN tool (toolbar tap so the highlight moves too) — the kid can
-    // keep drawing right away instead of accidentally lassoing.
-    touch::tap(55, 170).ok();
+    // Finish on the PEN tool so the kid can keep drawing instead of accidentally
+    // lassoing. Let the panel settle after the big injection first, or the toolbar
+    // tap can land before the UI is responsive and the selection tool stays selected.
+    std::thread::sleep(Duration::from_millis(400));
+    select_pen_tool();
     result?;
 
     // NOTE: no "after" capture here. grabWindow right after the illustration

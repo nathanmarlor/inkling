@@ -1,11 +1,12 @@
 # inkling
 
-Draw a rough sketch on a [reMarkable 2](https://remarkable.com), and a moment after
-you lift the pen it's replaced — on the same page — with a polished line illustration
-of what you drew.
+Draw something on a [reMarkable 2](https://remarkable.com), circle it, and tap a button
+in the tablet's own menu — a moment later your scribble is replaced, on the same page,
+with a polished line illustration of what you drew.
 
 Scribble a bike; get a clean pen-and-ink bike. The rough idea goes in, an *inkling* of
-the finished thing comes back.
+the finished thing comes back. And if you write a **question** instead of drawing, it
+reads your handwriting and writes the answer underneath in ink.
 
 > **Status: proof-of-concept / hobby project.** It runs on a real device and does the
 > full loop, but it's rough around the edges and targets one specific tablet + OS. Not
@@ -15,37 +16,42 @@ the finished thing comes back.
 
 Three pieces:
 
-- **`inkling`** — a small Rust daemon that runs on the tablet. It watches the pen for
-  when you've *finished* a sketch (a short quiet period after you stop drawing and lift
-  the pen), grabs the current page, sends it to an image model, clears the page, and
-  draws the result back as real pen strokes.
-- **`inklingfb`** — a tiny [xovi](https://github.com/asivery/xovi) extension that clears
-  the current page cleanly by driving the tablet UI's own scene, so the device repaints
-  the e-ink panel itself. This replaces the crude "erase everything with the eraser
-  tool" approach and is instant and undoable.
-- **`inkling-core`** — the pure, host-testable logic (the finished-sketch state machine,
-  the raster→pen-stroke vectorizer, geometry/calibration). No device dependencies, unit
-  tested.
+- **`inkling`** — a small Rust daemon on the tablet. It reads the selected strokes,
+  sends them to a model, and draws the result back as real pen strokes.
+- **`inklingfb`** — a tiny [xovi](https://github.com/asivery/xovi) extension that runs
+  inside the tablet UI (`xochitl`). It injects the **AI** button into xochitl's own
+  selection menu, reads/deletes the selection, captures the screen, and manages a
+  scratch layer for the loading spinner — all through xochitl's own Qt entry points.
+- **`inkling-core`** — the pure, host-testable logic (the raster→pen-stroke vectorizer,
+  geometry/calibration, the finished-sketch state machine for the legacy mode). No
+  device dependencies, unit tested.
 
-The loop:
+The flow (selection mode):
 
 ```
-you draw ─▶ inkling detects you finished ─▶ capture the page
-         ─▶ image model turns the sketch into a clean illustration
-         ─▶ inklingfb clears the page ─▶ inkling redraws the result as pen strokes
+lasso some strokes ─▶ tap the AI button in the selection menu
+   │
+   ├─ a drawing?      ─▶ image model turns it into a clean illustration
+   │                     ─▶ delete the sketch ─▶ draw the illustration in its place
+   │
+   └─ handwriting?    ─▶ a vision model reads and answers the question
+                         ─▶ write the answer in ink below it (question kept)
 ```
 
-If you pick the pen back up mid-cycle, the request is abandoned and the page is left
-exactly as you drew it.
+The AI button decides which path to take by looking at the selection. A loading
+hourglass shows on a temporary layer while it thinks, then it hands you back the pen.
+
+There's also a legacy **inactivity** mode (`[mode] trigger = "inactivity"`) that turns
+the whole page automatically a few seconds after you stop drawing — no button, no
+selection. Selection mode is the one that's actively developed.
 
 ## Requirements
 
-- A **reMarkable 2** with root SSH access (it ships with SSH; password is in the tablet's
-  Settings → Help → About).
-- **[xovi](https://github.com/asivery/xovi)** installed on the tablet (for the page-clear
-  extension).
-- An **[OpenRouter](https://openrouter.ai) API key** (the daemon calls an image model —
-  default `google/gemini-2.5-flash-image`).
+- A **reMarkable 2** with root SSH access (password in Settings → Help → About).
+- **[xovi](https://github.com/asivery/xovi)** installed on the tablet.
+- An **[OpenRouter](https://openrouter.ai) API key** — the daemon calls an image model
+  (default `google/gemini-2.5-flash-image`) and, for questions, a vision model
+  (`google/gemini-2.5-flash`).
 - A cross toolchain on your build machine:
   - Rust with the `armv7-unknown-linux-musleabihf` target.
   - An `armv7-unknown-linux-gnueabihf-gcc` (e.g. via Homebrew) to build the extension.
@@ -86,10 +92,13 @@ one-time calibration, and start the daemon:
 
 ```sh
 ssh root@<tablet-ip> ./inkling calibrate        # follow the on-screen taps
-ssh root@<tablet-ip> systemctl start inkling     # or run ./inkling run directly
+ssh root@<tablet-ip> systemctl start inkling
 ```
 
-Now draw something and lift the pen.
+Now draw something, lasso it, and tap **AI**.
+
+> After a tablet reboot the extension is present but xochitl doesn't auto-load it on the
+> cold boot — run `systemctl restart xochitl` once, then `systemctl start inkling`.
 
 ## Configuration
 
@@ -100,68 +109,73 @@ Now draw something and lift the pen.
 api_key = "sk-or-..."                 # your OpenRouter key
 model   = "google/gemini-2.5-flash-image"
 
-[watch]
-dwell_s        = 3.0                   # quiet seconds after you stop before it fires
-rate_limit_s   = 15.0                  # minimum gap between requests
-min_new_ink_px = 400                   # ignore trivial marks
+[mode]
+trigger     = "selection"             # "selection" (AI button) | "inactivity" (auto)
+orientation = "auto"                  # "portrait" (default) | "landscape" | "auto"
 
 [ink]
-draw_pps   = 800.0                     # pen-stroke injection speed (points/sec)
-max_points = 6000                      # cap on injected points per illustration
+draw_pps   = 4000.0                   # pen-stroke injection speed (points/sec)
+max_points = 30000                    # cap on injected points
 
 [archive]
-dir = "/home/root/.local/share/inkling"   # keeps sketch+result pairs
+dir = "/home/root/.local/share/inkling"   # keeps sketch + result pairs
 
 [control]
-pause_file = "/tmp/inkling.pause"      # touch this to pause the daemon
+pause_file = "/tmp/inkling.pause"     # touch this to pause the daemon
 ```
 
 ## Technical notes
 
 Bits that might be useful if you're hacking on a reMarkable 2 (OS 3.x, Qt 6, `xochitl`).
-None of this needs the device opened up or a special developer mode — just root SSH.
+None of this needs the device opened up or a special developer mode — just root SSH, and
+the reMarkable hacking community's older guides are mostly out of date against current
+firmware, so most of this was re-derived from the running device. See
+[`xovi-ext/README.md`](xovi-ext/README.md) for the extension internals.
+
+**Driving the UI.** `xochitl` is a closed, stripped Qt 6 binary with no API. The
+extension gets inside it at runtime: it walks the live QtQuick **visual** tree
+(`QQuickItem::childItems`) to the active page's objects and calls their own Qt
+meta-methods by name (`QMetaObject::invokeMethod`) — clear, delete-selection, layers,
+tool switch — all resolved via `dlsym` against the exported Qt symbols. It installs
+**no function hooks** (xovi's arm32 trampoline races on hot paths and crashes). All Qt
+access happens on the GUI thread; the worker thread only watches trigger files.
 
 **Injecting pen strokes.** A hotplugged `uinput` device doesn't work — `xochitl` ignores
 it. You have to write `input_event`s directly into the *real* digitizer node
-(`/dev/input/event1`), Wacom-style (`ABS_X`/`ABS_Y` + pressure + `BTN_TOOL_PEN`).
-Screen→pen coordinates are a per-device affine transform, so there's a one-time
-`calibrate` step that drops three marks and reads back where they landed.
+(`/dev/input/event1`), Wacom-style. Screen→pen is a per-device affine transform, so
+there's a one-time `calibrate` step that drops three marks and reads back where they
+landed. The pen tool must be active or injected strokes are treated as lasso gestures.
 
-**Reading the screen.** There's no QPA screengrab, and `/dev/fb0` on the rM2 is the raw
-LCDIF buffer, not what's on the panel. Instead, capture reads `xochitl`'s own backing
-image straight out of `/proc/<pid>/mem`: it's the first large anonymous read-write
-mapping after `/dev/fb0` in the process maps — portrait **1404×1872**, BGRA, **stride
-5616** (4 bytes/px on firmware ≥ 3.24). That mapping shifts after `xochitl` restarts, so
-the code locks onto it by size rather than a fixed address. (Technique originally from
-[ghostwriter](https://github.com/awwaiid/ghostwriter); geometry re-derived for this OS.)
+**Reading the screen.** Capture asks the extension to render the live window with
+`QQuickWindow::grabWindow()` and writes the frame to a file — portrait **1404×1872**,
+RGB32. This is drift-free across restarts (an earlier `/proc/<pid>/mem` framebuffer read
+worked but its address moved after every restart and occasionally fed the model garbage).
+Do **not** grab while pen strokes are being injected — `grabWindow` contends with
+xochitl's render and wedges the e-ink panel.
 
-**Clearing the page.** rM2 ink is binary black strokes with no per-pixel alpha, so you
-can't "fade" it — the only white is the eraser tool. The clean approach is to drive
-`xochitl`'s *own* clear: the `inklingfb` [xovi](https://github.com/asivery/xovi) extension
-walks the live QtQuick **visual** tree (`QQuickItem::childItems`, from the window's
-`QQuickRootItem`) to the active page's `SceneController`, then invokes `clearLines` +
-`clearRootDocument` by name via `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`.
-`xochitl` performs the erase *and* the e-ink refresh itself — which matters because the
-rM2 has no hardware EPDC (the waveform/SWTCON lives in software inside `xochitl`), so
-third-party framebuffer writes never refresh the panel on their own. Bonus: the clear is
-undoable. Gotchas: only call `childItems()` on real `QQuickItem`s, and only marshal
-cross-thread calls with `QueuedConnection` — a blocking call from a worker thread
-deadlocks the UI and the watchdog reboots the device.
+**The AI button.** Injected as a QML item *beside* the selection menu (parented to the
+menu's parent), never *into* it — the menu is a Qt Quick `Container` that absorbs added
+children into its content model, and a foreign child there crashes xochitl on teardown.
+Tapping it fires a loopback XHR to the daemon.
 
-**A dead end worth knowing.** You *can* grab the exact panel buffer by hooking the
-`QImage(uchar*, …)` constructor from a xovi extension (this is what
-[framebuffer-spy](https://github.com/asivery/rm-xovi-extensions) does). It works — but
-that ctor sits on `xochitl`'s hot, multi-threaded render path, and xovi wraps every
-hooked call in a per-symbol mutex and rewrites the function on each original-call, which
-serialised rendering enough to trip `xochitl`'s "Something went wrong" screen. We reverted
-it and kept capture in `/proc/mem`. If you retry, solve the render-path contention first.
+**Clearing / deleting.** rM2 ink is binary black strokes with no per-pixel alpha, so you
+can't "fade" it. Instead the extension drives xochitl's own clear/delete, which repaints
+the e-ink itself (the rM2 has no hardware EPDC; the waveform lives in software inside
+`xochitl`, so third-party framebuffer writes never refresh the panel). The clean
+selection delete is emitting the selection menu's own `deleteSelection()` signal — the
+trash button's path, with the correct internal edit id; a programmatic
+`deleteSelectedItems`/rect-select delete crashes xochitl.
+
+**Answer handwriting.** Question answers are drawn with a vendored **Hershey**
+single-stroke plotter font (`daemon/inkling/src/futural.jhf`) — centre-line letters that
+read as clean handwriting. Rasterising a normal font and skeleton-tracing it fragmented
+the letters; drawing glyph outlines gave hollow "bubble" letters.
 
 ## Privacy
 
-The daemon sends an image of the current page to the OpenRouter API to generate the
-illustration — so whatever is on the page at that moment leaves the device. Your API key
-stays on the tablet (in the config file); nothing else is sent anywhere. It only acts on
-the page you're actively drawing on.
+The daemon sends an image of the selected strokes to the OpenRouter API to generate the
+illustration or answer — so whatever you convert leaves the device. Your API key stays on
+the tablet (in the config file); nothing else is sent anywhere.
 
 ## License
 
