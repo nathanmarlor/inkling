@@ -29,6 +29,16 @@ const BTN_TOOL_PEN: u16 = 0x140;
 const BTN_TOOL_RUBBER: u16 = 0x141;
 const BTN_TOUCH: u16 = 0x14a;
 
+/// How a conversion is triggered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TriggerMode {
+    /// Original flow: finished-sketch detection turns the whole page after a quiet period.
+    Inactivity,
+    /// New flow: the user selects strokes and taps the "Convert" selection-menu item,
+    /// and only that selection is turned into the illustration, fitted to its bounds.
+    Selection,
+}
+
 pub struct DaemonConfig {
     pub api_key: String,
     pub model: Option<String>,
@@ -41,6 +51,7 @@ pub struct DaemonConfig {
     pub calibration_path: String,
     pub archive_dir: String,
     pub pause_file: String,
+    pub trigger_mode: TriggerMode,
 }
 
 impl Default for DaemonConfig {
@@ -60,6 +71,7 @@ impl Default for DaemonConfig {
             calibration_path: "/home/root/.config/inkling/calibration.toml".into(),
             archive_dir: "/home/root/.local/share/inkling/archive".into(),
             pause_file: "/home/root/.config/inkling/pause".into(),
+            trigger_mode: TriggerMode::Inactivity,
         }
     }
 }
@@ -416,6 +428,10 @@ pub fn run(config: DaemonConfig) -> Result<()> {
     let client = OpenRouterClient::new(config.api_key.clone(), config.model.clone());
     std::fs::create_dir_all(&config.archive_dir).ok();
 
+    if config.trigger_mode == TriggerMode::Selection {
+        return run_selection_mode(&config, &client, &calibration);
+    }
+
     let mut event_file = std::fs::File::open(PEN_NODE).with_context(|| format!("opening {PEN_NODE} for watching"))?;
     set_nonblocking(event_file.as_raw_fd())?;
 
@@ -529,6 +545,98 @@ fn draw_png(png: &[u8], calibration: &AffineTransform, config: &DaemonConfig) ->
     }
     pen.tool_out()?;
     Ok(())
+}
+
+// --- selection-convert mode ([mode] trigger = "selection") ---
+// File contract with the inklingfb extension + qmldiff "Convert" button:
+//   /tmp/inkling_convert_go : extension signals a convert is requested (bounds written)
+//   /tmp/inkling_selbounds  : "x y w h" — selection bbox in portrait framebuffer px
+//   /tmp/inklingfb_delsel   : daemon asks the extension to delete the selected strokes
+const CONVERT_GO: &str = "/tmp/inkling_convert_go";
+const SELBOUNDS: &str = "/tmp/inkling_selbounds";
+const DELSEL_TRIGGER: &str = "/tmp/inklingfb_delsel";
+
+fn read_selbounds() -> Result<(u32, u32, u32, u32)> {
+    let s = std::fs::read_to_string(SELBOUNDS).context("reading selection bounds")?;
+    let v: Vec<u32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    anyhow::ensure!(v.len() == 4, "selection bounds must be 'x y w h', got {s:?}");
+    Ok((v[0], v[1], v[2], v[3]))
+}
+
+/// Draw an illustration fitted into a selection bounding box (portrait page px).
+fn draw_png_bounds(png: &[u8], region: (u32, u32, u32, u32), calibration: &AffineTransform, config: &DaemonConfig) -> Result<()> {
+    let tmp = "/tmp/inkling_draw.png";
+    std::fs::write(tmp, png)?;
+    let (vec_result, _, _) = crate::vectorize_for_bounds(tmp, true, config.max_points, region)?;
+    log::info!("drawing {} strokes into selection...", vec_result.strokes.len());
+    let mut pen = VirtualPen::open_existing(PEN_NODE)?;
+    pen.tool_in(Tool::Pen)?;
+    for s in &vec_result.strokes {
+        let dense = crate::on_device::densify(s, 3.0);
+        pen.stroke_display(&dense, calibration, config.draw_pps)?;
+    }
+    pen.tool_out()?;
+    Ok(())
+}
+
+/// One selection→illustration conversion: crop the capture to the selection bounds,
+/// archive before, generate, archive after, delete the selected strokes, draw fitted.
+fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
+    let (mut bx, mut by, mut bw, mut bh) = read_selbounds()?;
+    let frame = cap::capture_now()?;
+    if looks_like_garbage(&frame) {
+        anyhow::bail!("capture looks like noise (framebuffer mis-aligned or panel asleep) — aborting convert");
+    }
+    // Clamp the region to the frame so an off/oversized bbox can't panic the crop.
+    let (fw, fh) = (frame.width(), frame.height());
+    bx = bx.min(fw.saturating_sub(1));
+    by = by.min(fh.saturating_sub(1));
+    bw = bw.min(fw - bx).max(1);
+    bh = bh.min(fh - by).max(1);
+    log::info!("converting selection {bw}x{bh} at ({bx},{by})");
+
+    // Crop → landscape (the model + draw path work in the landscape drawing view).
+    let crop = image::imageops::crop_imm(&frame, bx, by, bw, bh).to_image();
+    let land = image::imageops::rotate270(&crop);
+    let mut sketch_png = Vec::new();
+    image::DynamicImage::ImageLuma8(land)
+        .write_to(&mut std::io::Cursor::new(&mut sketch_png), image::ImageFormat::Png)?;
+
+    // Before/after history, named by timestamp.
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    std::fs::create_dir_all(&config.archive_dir).ok();
+    std::fs::write(format!("{}/{ts}-before.png", config.archive_dir), &sketch_png).ok();
+
+    log::info!("generating illustration...");
+    let illus = client.sketch_to_illustration(&sketch_png)?;
+    std::fs::write(format!("{}/{ts}-after.png", config.archive_dir), &illus).ok();
+
+    // Remove the user's sketch strokes (the extension deletes the live selection),
+    // let the e-ink settle, then draw the illustration into the same bounds.
+    std::fs::write(DELSEL_TRIGGER, []).ok();
+    std::thread::sleep(Duration::from_millis(900));
+    draw_png_bounds(&illus, (bx, by, bw, bh), calibration, config)?;
+    log::info!("selection convert complete");
+    Ok(())
+}
+
+/// Selection-driven loop: wait for the extension/qmldiff button to request a convert.
+fn run_selection_mode(config: &DaemonConfig, client: &OpenRouterClient, calibration: &AffineTransform) -> Result<()> {
+    log::info!(
+        "inkling daemon started (SELECTION mode, model {})",
+        config.model.as_deref().unwrap_or(crate::imagegen::DEFAULT_MODEL)
+    );
+    let _ = std::fs::remove_file(CONVERT_GO); // ignore a stale request from a prior run
+    loop {
+        if std::path::Path::new(CONVERT_GO).exists() {
+            if let Err(e) = convert_selection(config, client, calibration) {
+                log::error!("selection convert failed: {e:#}");
+            }
+            let _ = std::fs::remove_file(CONVERT_GO);
+            let _ = std::fs::remove_file(SELBOUNDS);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// Wait for the illustration, showing the animated hourglass while it generates.

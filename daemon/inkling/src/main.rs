@@ -136,12 +136,36 @@ fn main() -> Result<()> {
     }
 }
 
+pub const PAGE_W: u32 = 1404;
+pub const PAGE_H: u32 = 1872;
+
+/// Vectorize an image and fit it into the whole page (with a UI-clearing margin).
 pub fn vectorize_for_page(input: &str, landscape: bool, max_points: usize) -> Result<(VectorizeResult, u32, u32)> {
+    // Fit inside the page with a generous margin. This must keep every injected
+    // pen stroke well clear of the on-screen UI — the toolbar runs down one edge
+    // and the close/settings buttons sit in the top corners — because the pen
+    // taps those controls (it was changing tool/colour mid-draw). A uniform inset
+    // clears an edge-strip toolbar whichever side it's on for the current rotation.
+    const MARGIN: u32 = 170;
+    vectorize_for_bounds(input, landscape, max_points, (MARGIN, MARGIN, PAGE_W - 2 * MARGIN, PAGE_H - 2 * MARGIN))
+}
+
+/// Vectorize an image and fit it, centred, into a target region `(x, y, w, h)` in
+/// portrait page pixels — used to place a converted selection back within its own
+/// bounding box. Returns the result (strokes offset into page coords) + fitted size.
+pub fn vectorize_for_bounds(
+    input: &str,
+    landscape: bool,
+    max_points: usize,
+    region: (u32, u32, u32, u32),
+) -> Result<(VectorizeResult, u32, u32)> {
+    let (rx, ry, rw, rh) = region;
+    anyhow::ensure!(rw > 0 && rh > 0, "empty target region for vectorize");
     let src = image::open(input).context("loading input image")?;
     // Composite over white BEFORE dropping alpha. Model output is often line art
     // on a transparent background (RGB≈0, alpha=0); a plain to_luma8() would read
-    // that as pure black and threshold the whole page as ink (minutes of hatching
-    // a black rectangle). Alpha-blend onto white so transparent stays white.
+    // that as pure black and threshold the whole region as ink. Alpha-blend onto
+    // white so transparent stays white.
     let mut rgba = src.to_rgba8();
     for p in rgba.pixels_mut() {
         let a = p[3] as u16;
@@ -155,20 +179,12 @@ pub fn vectorize_for_page(input: &str, landscape: bool, max_points: usize) -> Re
     let rgba = if landscape { image::imageops::rotate90(&rgba) } else { rgba };
     let img = image::DynamicImage::ImageRgba8(rgba);
 
-    // Fit inside the page with a generous margin. This must keep every injected
-    // pen stroke well clear of the on-screen UI — the toolbar runs down one edge
-    // and the close/settings buttons sit in the top corners — because the pen
-    // taps those controls (it was changing tool/colour mid-draw). A uniform inset
-    // clears an edge-strip toolbar whichever side it's on for the current rotation.
-    const PAGE_W: u32 = 1404;
-    const PAGE_H: u32 = 1872;
-    const MARGIN: u32 = 170;
     let img = img
-        .resize(PAGE_W - 2 * MARGIN, PAGE_H - 2 * MARGIN, image::imageops::FilterType::Lanczos3)
+        .resize(rw, rh, image::imageops::FilterType::Lanczos3)
         .to_luma8();
     let (w, h) = img.dimensions();
-    let ox = (PAGE_W - w) / 2;
-    let oy = (PAGE_H - h) / 2;
+    let ox = rx + (rw - w) / 2;
+    let oy = ry + (rh - h) / 2;
 
     // Smoother, flowing strokes: a larger simplify epsilon collapses the
     // tiny jitters skeleton-tracing produces into clean lines, and wider
@@ -319,6 +335,13 @@ fn run_daemon(config_path: &str) -> Result<()> {
             if let Some(n) = geti("ink", "max_points") { cfg.max_points = n.max(0) as usize; }
             if let Some(a) = gets("archive", "dir") { cfg.archive_dir = a; }
             if let Some(pf) = gets("control", "pause_file") { cfg.pause_file = pf; }
+            if let Some(m) = gets("mode", "trigger") {
+                cfg.trigger_mode = match m.to_ascii_lowercase().as_str() {
+                    "selection" => daemon::TriggerMode::Selection,
+                    "inactivity" => daemon::TriggerMode::Inactivity,
+                    other => anyhow::bail!("unknown [mode] trigger = {other:?} (want \"inactivity\" or \"selection\")"),
+                };
+            }
         }
         Err(e) => anyhow::bail!("cannot read config {config_path}: {e}"),
     }
