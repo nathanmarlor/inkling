@@ -595,28 +595,42 @@ fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibrati
     bh = bh.min(fh - by).max(1);
     log::info!("converting selection {bw}x{bh} at ({bx},{by})");
 
-    // Crop → landscape (the model + draw path work in the landscape drawing view).
+    // History, named by timestamp. BEFORE = the whole screen (landscape view).
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    std::fs::create_dir_all(&config.archive_dir).ok();
+    let _ = save_gray_png(&image::imageops::rotate270(&frame), &format!("{}/{ts}-before.png", config.archive_dir));
+
+    // The model only gets the selection crop (→ landscape drawing view).
     let crop = image::imageops::crop_imm(&frame, bx, by, bw, bh).to_image();
     let land = image::imageops::rotate270(&crop);
     let mut sketch_png = Vec::new();
     image::DynamicImage::ImageLuma8(land)
         .write_to(&mut std::io::Cursor::new(&mut sketch_png), image::ImageFormat::Png)?;
 
-    // Before/after history, named by timestamp.
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-    std::fs::create_dir_all(&config.archive_dir).ok();
-    std::fs::write(format!("{}/{ts}-before.png", config.archive_dir), &sketch_png).ok();
-
     log::info!("generating illustration...");
     let illus = client.sketch_to_illustration(&sketch_png)?;
-    std::fs::write(format!("{}/{ts}-after.png", config.archive_dir), &illus).ok();
 
     // Remove the user's sketch strokes (the extension deletes the live selection),
     // let the e-ink settle, then draw the illustration into the same bounds.
     std::fs::write(DELSEL_TRIGGER, []).ok();
     std::thread::sleep(Duration::from_millis(900));
     draw_png_bounds(&illus, (bx, by, bw, bh), calibration, config)?;
+
+    // AFTER = the whole screen once the illustration is on the page.
+    std::thread::sleep(Duration::from_millis(500));
+    if let Ok(after) = cap::capture_now() {
+        let _ = save_gray_png(&image::imageops::rotate270(&after), &format!("{}/{ts}-after.png", config.archive_dir));
+    }
     log::info!("selection convert complete");
+    Ok(())
+}
+
+/// Encode a grayscale image to a PNG file.
+fn save_gray_png(img: &image::GrayImage, path: &str) -> Result<()> {
+    let mut png = Vec::new();
+    image::DynamicImage::ImageLuma8(img.clone())
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    std::fs::write(path, png)?;
     Ok(())
 }
 

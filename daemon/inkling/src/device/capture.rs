@@ -59,7 +59,9 @@ fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
     if mem.read_exact(&mut buf).is_err() {
         return -1.0;
     }
-    let (mut white, mut total) = (0u64, 0u64);
+    let (mut white, mut ink, mut total) = (0u64, 0u64, 0u64);
+    let (mut dup, mut dup_total) = (0u64, 0u64);
+    let half = WIDTH as usize / 2;
     let mut y = 0;
     while y < SAMPLE_ROWS {
         let ro = y * STRIDE as usize;
@@ -67,15 +69,38 @@ fn screen_score(mem: &mut fs::File, addr: u64) -> f64 {
         while x < WIDTH as usize {
             let o = ro + x * 4;
             let (b, g, r) = (buf[o] as i32, buf[o + 1] as i32, buf[o + 2] as i32);
-            if (b - g).abs() < 12 && (r - g).abs() < 12 && g > 200 {
+            let gray = (b - g).abs() < 12 && (r - g).abs() < 12;
+            if gray && g > 200 {
                 white += 1;
             }
+            if gray && g < 100 {
+                ink += 1;
+            }
             total += 1;
+            // Left/right equality: a 2 bytes/px buffer misread at 4 bytes/px tiles each
+            // row, so pixel x == pixel x+half everywhere.
+            if x < half {
+                let g2 = buf[ro + (x + half) * 4 + 1] as i32;
+                if (g - g2).abs() < 4 {
+                    dup += 1;
+                }
+                dup_total += 1;
+            }
             x += 4;
         }
         y += 4;
     }
-    if total == 0 { 0.0 } else { white as f64 / total as f64 }
+    if total == 0 {
+        return 0.0;
+    }
+    let dup_frac = if dup_total == 0 { 0.0 } else { dup as f64 / dup_total as f64 };
+    let ink_frac = ink as f64 / total as f64;
+    // A tiled decoy has near-perfect left/right equality AND real content. A genuinely
+    // blank page is also left/right-equal but has ~no ink, so don't reject that.
+    if dup_frac > 0.9 && ink_frac > 0.02 {
+        return 0.0;
+    }
+    white as f64 / total as f64
 }
 
 /// Find the framebuffer read address. The backing store is the first anonymous rw
