@@ -907,51 +907,21 @@ fn draw_png_bounds(
 /// programmatic selection + deleteSelection — that crashed xochitl twice.
 const SPINLAYER_TRIGGER: &str = "/tmp/inkling_spinlayer";
 
-const LAYERQ_TRIGGER: &str = "/tmp/inkling_layerq";
-const LAYER_OUT: &str = "/tmp/inkling_layer_out";
-
-/// Read the extension's live layer state as (currentLayer, layerCount).
-fn query_layer() -> Option<(i32, i32)> {
-    let _ = std::fs::remove_file(LAYER_OUT);
-    std::fs::write(LAYERQ_TRIGGER, []).ok()?;
-    for _ in 0..15 {
-        std::thread::sleep(Duration::from_millis(40));
-        let Ok(s) = std::fs::read_to_string(LAYER_OUT) else { continue };
-        let v: Vec<i32> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-        if v.len() >= 2 {
-            return Some((v[0], v[1]));
-        }
-    }
-    None
-}
-
-/// Send a spinlayer command and WAIT until it has landed, watching the LAYER COUNT
-/// (not currentLayer — that property is deferred and often never reflects the switch
-/// in a readback, which made this skip the spinner entirely). The extension queues
-/// addLayer then setCurrentLayer back-to-back, so once the count change is visible the
-/// setCurrentLayer queued right after it has also run and the scratch layer is current.
-/// `begin` waits for the count to grow, `end` for it to shrink back. False on timeout.
+/// Send a spinlayer command (add/remove the scratch layer) and wait a fixed beat for
+/// the queued layer switch to take effect. An earlier version POLLED a layerCount
+/// readback to confirm, but the readback is deferred (never reflected the change, so
+/// it always timed out) AND the ~40 rapid readbacks each triggered a full GUI-thread
+/// tree-walk mid-convert, which wedged the e-ink panel (froze the tablet). A plain
+/// wait is both correct-enough and safe. Returns true (best-effort).
 fn spinlayer(cmd: &[u8]) -> bool {
-    let baseline = query_layer().map(|(_, n)| n).unwrap_or(1);
     let _ = std::fs::write(SPINLAYER_TRIGGER, cmd);
-    let want_grow = cmd == b"begin";
-    let deadline = Instant::now() + Duration::from_millis(2500);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(60));
-        if let Some((_cur, count)) = query_layer() {
-            let settled = if want_grow {
-                count > baseline // scratch layer added (and setCurrentLayer ran right after)
-            } else {
-                count < baseline // scratch layer gone
-            };
-            if settled {
-                std::thread::sleep(Duration::from_millis(120)); // brief post-switch settle
-                return true;
-            }
-        }
+    // Let the trigger be consumed, then let the queued addLayer+setCurrentLayer run.
+    let deadline = Instant::now() + Duration::from_millis(600);
+    while std::path::Path::new(SPINLAYER_TRIGGER).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(40));
     }
-    log::warn!("spinlayer {:?} did not confirm within 2.5s", String::from_utf8_lossy(cmd));
-    false
+    std::thread::sleep(Duration::from_millis(700));
+    true
 }
 
 /// One selection→illustration conversion: grab the screen, find the selection's
@@ -1097,12 +1067,9 @@ fn convert_selection(config: &DaemonConfig, client: &OpenRouterClient, calibrati
     touch::tap(55, 170).ok();
     result?;
 
-    // AFTER = the whole screen once the illustration is on the page.
-    std::thread::sleep(Duration::from_millis(500));
-    if let Ok(after) = cap::capture_now() {
-        let oriented_after = if landscape { image::imageops::rotate90(&after) } else { after };
-        let _ = save_gray_png(&oriented_after, &format!("{}/{ts}-after.png", config.archive_dir));
-    }
+    // NOTE: no "after" capture here. grabWindow right after the illustration
+    // injection contends with xochitl's still-settling render and can wedge the
+    // e-ink panel (froze the tablet). The before/sketch archives are enough.
     log::info!("selection convert complete");
     Ok(())
 }
