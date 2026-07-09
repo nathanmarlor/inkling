@@ -333,6 +333,13 @@ fn run_daemon(config_path: &str) -> Result<()> {
             let geti = |t: &str, k: &str| get(t, k).and_then(|x| x.as_integer());
             let gets = |t: &str, k: &str| get(t, k).and_then(|x| x.as_str().map(String::from));
 
+            if let Some(p) = gets("imagegen", "provider") {
+                cfg.provider = match p.to_ascii_lowercase().as_str() {
+                    "openrouter" => imagegen::Provider::OpenRouter,
+                    "gemini" => imagegen::Provider::Gemini,
+                    other => anyhow::bail!("unknown [imagegen] provider = {other:?} (want \"openrouter\" or \"gemini\")"),
+                };
+            }
             if let Some(k) = gets("imagegen", "api_key") { cfg.api_key = k; }
             if let Some(m) = gets("imagegen", "model") { cfg.model = Some(m); }
             if let Some(d) = getf("watch", "dwell_s") { cfg.dwell_s = d; }
